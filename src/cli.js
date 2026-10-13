@@ -459,15 +459,55 @@ export function formatValue(val) {
   return String(val);
 }
 
+// A row of the perp-positions payload: the wrapper plus its nested `position`.
+// `position` may be absent because --fields runs before formatting and can
+// strip it, so a wrapper-only entry is still a row. Anything else in that key
+// means the payload is not the perp shape and belongs in the JSON fallback.
+function isPositionEntry(entry) {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  const { position } = entry;
+  return position === undefined
+    || (position !== null && typeof position === 'object' && !Array.isArray(position));
+}
+
+// Perp positions wrap each row in `position`. Flatten only for tabular
+// presentation so JSON output retains the API payload and account summaries.
+function locateTabularRows(data) {
+  let sawPositions = false;
+  if (data?.success !== false) {
+    for (const payload of [data, data?.data, data?.data?.data]) {
+      const positions = payload?.asset_positions;
+      if (!Array.isArray(positions)) continue;
+      sawPositions = true;
+      const rows = positions.every(isPositionEntry)
+        ? positions.map(({ position, ...fields }) => ({ ...position, ...fields }))
+        : null;
+      // A row with no fields renders as a blank line, which tells the reader
+      // less than the JSON fallback does. Treat it as "not the perp shape".
+      if (rows && rows.every(row => Object.keys(row).length > 0)) return { rows };
+    }
+  }
+  // An `asset_positions` array that does not hold perp rows is malformed, not
+  // a descriptive row array that happens to share the name. Reading it as one
+  // would drop the wrapper and surface the broken rows as columns, so leave it
+  // to the payload fallback.
+  return sawPositions ? null : locateRows(data, { descriptive: true });
+}
+
+// Records for the tabular formatters: the located rows, or the payload itself
+// when nothing matched. Rows that carry no fields at all would render as blank
+// lines, which says less than the payload does, so they take that same
+// fallback. An empty row set is left alone — it means "no results".
+function tabularRecords(data) {
+  if (typeof data !== 'object' || data === null) return [];
+  const rows = locateTabularRows(data)?.rows;
+  if (rows && (rows.length === 0 || rows.some(row => Object.keys(row).length > 0))) return rows;
+  return [Array.isArray(data) ? { data } : data];
+}
+
 // Table formatter for human-readable output
 export function formatTable(data) {
-  // Extract array of records from various response shapes
-  const located = locateRows(data, { descriptive: true });
-  let records = located?.rows || [];
-  if (!located && typeof data === 'object' && data !== null) {
-    // Single object - convert to array
-    records = [Array.isArray(data) ? { data } : data];
-  }
+  const records = tabularRecords(data);
 
   if (records.length === 0) {
     return 'No data';
@@ -526,12 +566,7 @@ export function formatTable(data) {
  * Format data as CSV with header row
  */
 export function formatCsv(data) {
-  // Extract array of records from various response shapes
-  const located = locateRows(data, { descriptive: true });
-  let records = located?.rows || [];
-  if (!located && typeof data === 'object' && data !== null) {
-    records = [Array.isArray(data) ? { data } : data];
-  }
+  const records = tabularRecords(data);
 
   if (records.length === 0) return '';
 

@@ -344,6 +344,24 @@ describe('formatTable', () => {
     expect(header).toContain('wallet_address');
     expect(header.indexOf('wallet_address')).toBeLessThan(header.indexOf('counterparty_address'));
   });
+
+  // A located array of field-less rows has no columns to render, so the table
+  // would come out as blank lines. Showing the payload says more.
+  it('should fall back to the payload when located rows carry no fields', () => {
+    const result = formatTable({ holdings: [{}, {}] });
+    expect(result).toContain('holdings');
+    expect(result.trim()).not.toBe('');
+  });
+
+  it('should still render rows when only some carry fields', () => {
+    const result = formatTable({ holdings: [{}, { symbol: 'SOL' }] });
+    expect(result).toContain('symbol');
+    expect(result).toContain('SOL');
+  });
+
+  it('should keep returning "No data" for a located empty array', () => {
+    expect(formatTable({ data: [] })).toBe('No data');
+  });
 });
 
 describe('formatAlertsTable', () => {
@@ -5892,6 +5910,14 @@ describe('formatCsv', () => {
     const data = [{ name: 'Hello, World', value: 1 }];
     const result = formatCsv(data);
     expect(result).toContain('"Hello, World"');
+  });
+
+  it('should fall back to the payload when located rows carry no fields', () => {
+    expect(formatCsv({ holdings: [{}, {}] })).toContain('holdings');
+  });
+
+  it('should keep returning an empty string for a located empty array', () => {
+    expect(formatCsv({ data: [] })).toBe('');
   });
 
   it('should escape double quotes', () => {
