@@ -147,6 +147,16 @@ describe('evaluatePaymentRequirement — allowlist and basic pass', () => {
     expect(result.symbol).toBe('USDC');
   });
 
+  it('returns the payment details it approved, for the audit log', () => {
+    expect(evaluatePaymentRequirement({ ...BASE_USDC_REQUIREMENT, amount: 10000n })).toMatchObject({
+      ok: true,
+      network: 'eip155:8453',
+      asset: BASE_USDC_REQUIREMENT.asset,
+      payTo: '0xPaymentRecipient', // resolved from the pay_to alias
+      amountRaw: '10000', // always a string, even from a BigInt amount
+    });
+  });
+
   it('4. unknown asset on known network → refused (allowlist)', () => {
     const req = { ...BASE_USDC_REQUIREMENT, asset: '0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001' };
     const result = evaluatePaymentRequirement(req);

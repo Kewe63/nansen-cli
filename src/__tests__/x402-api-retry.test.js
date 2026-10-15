@@ -26,7 +26,11 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { NansenAPI, RESPONSE_META, X402_PAYMENT_REJECTED, ErrorCode, NansenError } from '../api.js';
+import { resetAuditWarningForTests, x402AuditLogPath } from '../x402-audit.js';
 
 function makeApi() {
   return new NansenAPI('test-key', 'https://api.nansen.ai');
@@ -297,5 +301,141 @@ describe('NansenAPI._x402Retry', () => {
       expect(err.code).toBe(ErrorCode.PAYMENT_AMBIGUOUS);
       expect(err.message).toMatch(/not attempting another payment/i);
     }
+  });
+});
+
+describe('NansenAPI._x402Retry — payment audit log', () => {
+  const URL_WITH_QUERY = 'https://api.nansen.ai/api/v1/profiler/address/balance?address=0xabc';
+  const DECISION = {
+    ok: true,
+    usd: 0.01,
+    symbol: 'USDC',
+    network: 'eip155:8453',
+    asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+    payTo: '0xRecipient',
+    amountRaw: '10000',
+  };
+  let mockFetch;
+  let originalHome;
+  let home;
+
+  const readRecords = () => fs.readFileSync(x402AuditLogPath(), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  const pay = (options = {}) => makeApi()._x402Retry(
+    'secret-payment-signature', 'local wallet alice', 'eip155:8453', URL_WITH_QUERY, { address: '0xabc' },
+    { method: 'POST', ...options },
+    { asset: DECISION.asset, checkBalance: false, provider: 'local', decision: DECISION },
+  );
+  const response = (status, body, requestId = 'req-1') => ({
+    ok: status >= 200 && status < 300,
+    status,
+    headers: new Map([['x-request-id', requestId]]),
+    json: body instanceof Error ? async () => { throw body; } : async () => body,
+  });
+
+  beforeEach(() => {
+    mockFetch = vi.fn();
+    vi.stubGlobal('fetch', mockFetch);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    originalHome = process.env.HOME;
+    home = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-x402-retry-audit-'));
+    process.env.HOME = home;
+    resetAuditWarningForTests();
+  });
+
+  afterEach(() => {
+    process.env.HOME = originalHome;
+    fs.rmSync(home, { recursive: true, force: true });
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('records the signed payment and its acceptance under one id, without secrets', async () => {
+    mockFetch.mockResolvedValue(response(200, { data: [] }));
+
+    await pay();
+
+    const records = readRecords();
+    const base = {
+      id: expect.any(String),
+      timestamp: expect.any(String),
+      provider: 'local',
+      wallet: 'local wallet alice',
+      network: 'eip155:8453',
+      asset: DECISION.asset,
+      symbol: 'USDC',
+      amountUsd: 0.01,
+      amountRaw: '10000',
+      payTo: '0xRecipient',
+      method: 'POST',
+      requestUrl: 'https://api.nansen.ai/api/v1/profiler/address/balance',
+    };
+    expect(records).toEqual([
+      { ...base, event: 'signed' },
+      { ...base, event: 'accepted', httpStatus: 200, requestId: 'req-1' },
+    ]);
+    expect(records[1].id).toBe(records[0].id);
+    const raw = fs.readFileSync(x402AuditLogPath(), 'utf8');
+    expect(raw).not.toContain('secret-payment-signature');
+    expect(raw).not.toContain('0xabc');
+    expect(raw).not.toContain('test-key');
+  });
+
+  it('records an insufficient-balance rejection with its reason', async () => {
+    mockFetch.mockResolvedValue(response(402, { error: 'insufficient_funds' }));
+
+    expect(await pay()).toBe(X402_PAYMENT_REJECTED);
+
+    expect(readRecords()[1]).toMatchObject({ event: 'rejected', httpStatus: 402, reason: 'insufficient_balance' });
+  });
+
+  it('keeps a code-shaped rejection reason but never free text', async () => {
+    mockFetch
+      .mockResolvedValueOnce(response(402, { invalidReason: 'invalid_exact_evm_payload_signature' }))
+      .mockResolvedValueOnce(response(402, { error: 'Your payment was declined, contact support@example.com' }));
+
+    await pay();
+    await pay();
+
+    const rejected = readRecords().filter(r => r.event === 'rejected');
+    expect(rejected.map(r => r.reason)).toEqual(['invalid_exact_evm_payload_signature', null]);
+  });
+
+  it.each([
+    ['a 5xx', () => response(503, {}), 'server_error', 503],
+    ['an admission denial', () => response(429, {}), 'admission_denied', 429],
+    ['an unreadable rejection', () => response(402, new SyntaxError('bad json')), 'unreadable_rejection', 402],
+  ])('records %s as ambiguous before throwing', async (_name, makeResponse, reason, httpStatus) => {
+    mockFetch.mockResolvedValue(makeResponse());
+
+    await expect(pay()).rejects.toMatchObject({ code: ErrorCode.PAYMENT_AMBIGUOUS });
+
+    expect(readRecords().map(r => r.event)).toEqual(['signed', 'ambiguous']);
+    expect(readRecords()[1]).toMatchObject({ reason, httpStatus, requestId: 'req-1' });
+  });
+
+  it('records a transport failure after sending as ambiguous', async () => {
+    mockFetch.mockRejectedValue(new TypeError('network down'));
+
+    await expect(pay()).rejects.toMatchObject({ code: ErrorCode.PAYMENT_AMBIGUOUS });
+
+    expect(readRecords()[1]).toMatchObject({ event: 'ambiguous', reason: 'transport_error' });
+    expect(readRecords()[1]).not.toHaveProperty('httpStatus');
+  });
+
+  it('records an accepted payment whose body is unreadable as accepted', async () => {
+    mockFetch.mockResolvedValue(response(200, new SyntaxError('bad json')));
+
+    await expect(pay()).rejects.toMatchObject({ code: ErrorCode.PAYMENT_AMBIGUOUS });
+
+    expect(readRecords()[1]).toMatchObject({ event: 'accepted', httpStatus: 200, reason: 'unreadable_response' });
+  });
+
+  it('still completes the payment when the audit log cannot be written', async () => {
+    fs.mkdirSync(path.join(home, '.nansen'));
+    fs.writeFileSync(path.join(home, '.nansen', 'x402'), 'not a directory');
+    mockFetch.mockResolvedValue(response(200, { data: [1] }));
+
+    expect(await pay()).toMatchObject({ data: [1] });
+    expect(console.error).toHaveBeenCalledWith(expect.stringMatching(/could not write the payment audit log/));
   });
 });

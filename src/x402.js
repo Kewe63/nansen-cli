@@ -112,7 +112,8 @@ async function hasPermit2Allowance(network, token, owner, amount) {
 
 /**
  * Build a payment signature for a single requirement.
- * @returns {string|null} Base64 payment signature, or null on failure
+ * @returns {Promise<{ signature: string, payment: object }|null>} Base64 payment
+ *   signature and the policy decision that approved it, or null on failure
  */
 async function buildPaymentForRequirement(requirement, exported, url) {
   const decision = evaluatePaymentRequirement(requirement);
@@ -120,7 +121,15 @@ async function buildPaymentForRequirement(requirement, exported, url) {
     console.error(`[x402] ${decision.reason}`);
     return null;
   }
+  const signature = await signApprovedRequirement(requirement, exported, url);
+  return signature ? { signature, payment: decision } : null;
+}
 
+/**
+ * Sign a requirement the policy guard already approved.
+ * @returns {Promise<string|null>} Base64 payment signature, or null when skipped
+ */
+async function signApprovedRequirement(requirement, exported, url) {
   // exportWallet returns a null key for a chain the wallet file doesn't hold.
   // Skip that option with a clear reason instead of failing on the missing key.
   const rail = isEvmNetwork(requirement.network) ? 'evm' : 'solana';
@@ -179,12 +188,13 @@ async function buildPaymentForRequirement(requirement, exported, url) {
 
 /**
  * Generate payment signatures for all viable payment options, in priority order.
- * Yields { signature, network } objects. Caller should try each until one succeeds.
+ * Yields { signature, network, asset, payment } objects, where payment is the
+ * policy decision that approved the option. Caller should try each until one succeeds.
  *
  * @param {Response} response - The 402 HTTP response
  * @param {string} url - The original request URL
  * @param {object} options - { password, walletName }
- * @returns {AsyncGenerator<{ signature: string, network: string }>}
+ * @returns {AsyncGenerator<{ signature: string, network: string, asset: string, payment: object }>}
  */
 export async function* createPaymentSignatures(response, url, options = {}) {
   const requirements = parsePaymentRequirements(response);
@@ -224,8 +234,8 @@ export async function* createPaymentSignatures(response, url, options = {}) {
 
   for (const req of ranked) {
     try {
-      const sig = await buildPaymentForRequirement(req, exported, url);
-      if (sig) yield { signature: sig, network: req.network, asset: req.asset };
+      const built = await buildPaymentForRequirement(req, exported, url);
+      if (built) yield { signature: built.signature, network: req.network, asset: req.asset, payment: built.payment };
     } catch (err) {
       // This payment option failed to build; say why and try the next one
       // (otherwise a malformed server option only surfaces as a generic

@@ -318,6 +318,9 @@ describe("createPrivyPaymentSignatures", () => {
 
     expect(results).toHaveLength(1);
     expect(results[0].network).toBe("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp");
+    expect(results[0].payment).toMatchObject({
+      ok: true, symbol: "USDC", network: solRequirement.network, asset: solRequirement.asset, payTo: solRequirement.payTo, amountRaw: "50000",
+    });
     const decoded = JSON.parse(atob(results[0].signature));
     expect(decoded.x402Version).toBe(2);
     expect(decoded.payload.transaction).toBe("c2lnbmVkdHhiYXNlNjQ=");
@@ -356,6 +359,9 @@ describe("createPrivyPaymentSignatures", () => {
 
     expect(results).toHaveLength(1);
     expect(results[0].network).toBe("eip155:8453");
+    expect(results[0].payment).toMatchObject({
+      ok: true, symbol: "USDC", network: evmRequirement.network, asset: evmRequirement.asset, payTo: evmRequirement.payTo, amountRaw: "50000",
+    });
     // signature should be a base64-encoded JSON string
     const decoded = JSON.parse(atob(results[0].signature));
     expect(decoded.x402Version).toBe(2);

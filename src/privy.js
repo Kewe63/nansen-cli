@@ -281,11 +281,11 @@ async function getPrivySolanaWallet(client) {
 
 /**
  * Generate payment signatures for x402 using Privy server wallets.
- * Same yield contract as createPaymentSignatures() in x402.js: { signature, network, asset }
+ * Same yield contract as createPaymentSignatures() in x402.js: { signature, network, asset, payment }
  *
  * @param {Response} response - The 402 HTTP response
  * @param {string} url - The original request URL
- * @returns {AsyncGenerator<{ signature: string, network: string, asset: string }>}
+ * @returns {AsyncGenerator<{ signature: string, network: string, asset: string, payment: object }>}
  */
 export async function* createPrivyPaymentSignatures(response, url) {
   const requirements = parsePaymentRequirements(response);
@@ -333,7 +333,7 @@ export async function* createPrivyPaymentSignatures(response, url) {
             accepted: requirement,
           });
 
-          yield { signature: header, network: requirement.network, asset: requirement.asset };
+          yield { signature: header, network: requirement.network, asset: requirement.asset, payment: decision };
         } catch (err) {
           console.error(`[x402] Privy EVM signing failed for ${requirement.network}: ${err.message}`);
           continue;
@@ -379,7 +379,7 @@ export async function* createPrivyPaymentSignatures(response, url) {
           }
 
           const header = Buffer.from(JSON.stringify(payload)).toString("base64");
-          yield { signature: header, network: requirement.network, asset: requirement.asset };
+          yield { signature: header, network: requirement.network, asset: requirement.asset, payment: svmDecision };
         } catch (err) {
           console.error(`[x402] Privy Solana signing failed for ${requirement.network}: ${err.message}`);
           continue;

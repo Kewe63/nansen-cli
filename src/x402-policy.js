@@ -128,8 +128,9 @@ export function resolvePayTo(requirement) {
 
 /**
  * Decide whether an x402 payment requirement is safe to auto-sign.
- * Returns { ok: true, usd, symbol } when allowed, or { ok: false, reason }
- * with a human-readable, actionable reason when refused.
+ * Returns { ok: true, usd, symbol, network, asset, payTo, amountRaw } when
+ * allowed (amountRaw is the base-unit amount as a string), or
+ * { ok: false, reason } with a human-readable, actionable reason when refused.
  *
  * Enforces in order: known (network, asset) allowlist, optional payTo
  * allowlist, per-payment USD cap. Never signs; pure decision.
@@ -212,5 +213,5 @@ export function evaluatePaymentRequirement(requirement) {
     };
   }
 
-  return { ok: true, usd, symbol: known.symbol };
+  return { ok: true, usd, symbol: known.symbol, network, asset, payTo, amountRaw: String(amountRaw) };
 }

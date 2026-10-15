@@ -13,6 +13,7 @@ import { EVM_CHAINS } from './chain-ids.js';
 import { getAnonymousId, TELEMETRY_DISABLED } from './telemetry.js';
 import { readResponseMeta, stringHeader } from './response-meta.js';
 import { trace, traceRequest, traceResponse, traceError, traceRetry, traceCacheHit } from './debug.js';
+import { appendPaymentRecord, newPaymentId, sanitizeRequestUrl } from './x402-audit.js';
 
 /**
  * Key for the credit/rate-limit metadata attached to a successful response.
@@ -44,6 +45,19 @@ function isInsufficientBalanceRejection(data) {
   return [data.error, data.invalidReason].some(
     reason => typeof reason === 'string' && /insufficient_(funds|balance)\b/i.test(reason),
   );
+}
+
+/**
+ * The rejection's machine-readable reason code for the audit log, or null.
+ * Free text is never copied: only a short code-shaped value is kept.
+ */
+function rejectionReasonCode(data) {
+  if (isInsufficientBalanceRejection(data)) return 'insufficient_balance';
+  if (data === null || typeof data !== 'object') return null;
+  const code = [data.invalidReason, data.error].find(
+    reason => typeof reason === 'string' && /^[\w.:-]{1,100}$/.test(reason),
+  );
+  return code ?? null;
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -810,19 +824,39 @@ export class NansenAPI {
    * @param {boolean} [payment.checkBalance=true] - Whether the local default wallet's
    *   balance reflects this payment. False for WalletConnect, which pays from an
    *   external account the low-balance warning cannot read.
+   * @param {string|null} [payment.provider=null] - "local", "privy" or "walletconnect", for the audit log
+   * @param {object|null} [payment.decision=null] - The policy decision that approved
+   *   the payment ({ usd, symbol, payTo, amountRaw }), for the audit log
    * @returns {Promise<object|typeof X402_PAYMENT_REJECTED>}
    *
    * TODO: full fix — extract the entire x402 provider dispatch from request() into
    * an attemptX402Payment() method so adding a new payment provider only requires
    * touching that one method, not hunting inside the retry loop.
    */
-  async _x402Retry(signature, walletLabel, network, url, body, options = {}, { asset = null, checkBalance = true } = {}) {
+  async _x402Retry(signature, walletLabel, network, url, body, options = {}, { asset = null, checkBalance = true, provider = null, decision = null } = {}) {
     // Mirror request(): paid retries must use the original method. Hardcoding
     // POST burned a payment signature then hit the wrong route for GET/DELETE/PATCH.
     const method = options.method || 'POST';
     const isGet = method === 'GET';
     let paidResponse;
     const startedAt = Date.now();
+    // One "signed" record now and one outcome record before every exit below,
+    // sharing an id. Never the signature, bodies or query string.
+    const auditBase = {
+      id: newPaymentId(),
+      provider,
+      wallet: walletLabel,
+      network,
+      asset: decision?.asset ?? asset,
+      symbol: decision?.symbol ?? null,
+      amountUsd: decision?.usd ?? null,
+      amountRaw: decision?.amountRaw ?? null,
+      payTo: decision?.payTo ?? null,
+      method,
+      requestUrl: sanitizeRequestUrl(url),
+    };
+    const audit = (event, fields = {}) => appendPaymentRecord({ ...auditBase, event, ...fields });
+    audit('signed');
     // The signature itself is never traced — only that a paid retry went out.
     // As in the legacy key flow, payment authenticates this retry on its own.
     // Do not attach requestCredentials(): Bearer plus payment is rejected by API
@@ -845,6 +879,7 @@ export class NansenAPI {
       });
     } catch (err) {
       traceError({ method, url, durationMs: Date.now() - startedAt, attempt: 1, error: err.message });
+      audit('ambiguous', { reason: 'transport_error' });
       // The signature was already on the wire when the connection failed —
       // the server may have received and settled it before we lost the
       // response. Fail closed rather than let the caller sign and send a
@@ -865,10 +900,12 @@ export class NansenAPI {
       attempt: 1,
       payment: 'x402',
     });
+    const outcome = { httpStatus: paidResponse.status, requestId: requestIdOf(paidResponse) };
     if (!paidResponse.ok) {
       // An admission denial does not prove that a transmitted payment cannot
       // settle. Stop here instead of authorizing another rail or wallet.
       if ([401, 403, 429, 451].includes(paidResponse.status)) {
+        audit('ambiguous', { ...outcome, reason: 'admission_denied' });
         throw new NansenError(
           `x402 payment outcome unknown: paid request was denied (${paidResponse.status}). Not attempting another payment for the same request.`,
           ErrorCode.PAYMENT_AMBIGUOUS,
@@ -878,6 +915,7 @@ export class NansenAPI {
       // processed it before failing to respond. Only a readable non-5xx
       // rejection body is safe to treat as "try the next option".
       if (paidResponse.status >= 500) {
+        audit('ambiguous', { ...outcome, reason: 'server_error' });
         throw new NansenError(
           `x402 payment outcome unknown: server returned ${paidResponse.status} after the signed payment was transmitted. Not attempting another payment for the same request.`,
           ErrorCode.PAYMENT_AMBIGUOUS,
@@ -887,6 +925,7 @@ export class NansenAPI {
       try {
         rejection = await paidResponse.json();
       } catch (err) {
+        audit('ambiguous', { ...outcome, reason: 'unreadable_rejection' });
         throw new NansenError(
           `x402 payment outcome unknown: rejection response body was unreadable (${err.message}). Not attempting another payment for the same request.`,
           ErrorCode.PAYMENT_AMBIGUOUS,
@@ -898,6 +937,7 @@ export class NansenAPI {
           `${network ? ` on ${network}` : ''}. Fund it on that network or use another payment option.`,
         );
       }
+      audit('rejected', { ...outcome, reason: rejectionReasonCode(rejection) });
       return X402_PAYMENT_REJECTED;
     }
     if (walletLabel) {
@@ -919,11 +959,13 @@ export class NansenAPI {
       // The payment was accepted (2xx) — it settled. We just can't read the
       // response body, so surface that plainly rather than silently treating
       // it as a rejection and paying again.
+      audit('accepted', { ...outcome, reason: 'unreadable_response' });
       throw new NansenError(
         `x402 payment succeeded but its response body was unreadable (${err.message}). The payment was not repeated.`,
         ErrorCode.PAYMENT_AMBIGUOUS,
       );
     }
+    audit('accepted', outcome);
     const meta = readResponseMeta(paidResponse);
     this.lastResponseMeta = meta;
     if (meta && data !== null && typeof data === 'object') data[RESPONSE_META] = meta;
@@ -1133,8 +1175,8 @@ export class NansenAPI {
               // Default wallet is Privy: sign via Privy
               try {
                 const { createPrivyPaymentSignatures } = await import('./privy.js');
-                for await (const { signature, network, asset } of createPrivyPaymentSignatures(response, url)) {
-                  const result = await this._x402Retry(signature, `Privy wallet ${defaultWalletName}`, network, url, body, options, { asset });
+                for await (const { signature, network, asset, payment } of createPrivyPaymentSignatures(response, url)) {
+                  const result = await this._x402Retry(signature, `Privy wallet ${defaultWalletName}`, network, url, body, options, { asset, provider: 'privy', decision: payment });
                   if (result !== X402_PAYMENT_REJECTED) return result;
                 }
               } catch (privyErr) {
@@ -1150,8 +1192,8 @@ export class NansenAPI {
               // 1. Try local wallet with fallback across payment networks
               try {
                 const { createPaymentSignatures } = await import('./x402.js');
-                for await (const { signature, network, asset } of createPaymentSignatures(response, url)) {
-                  const result = await this._x402Retry(signature, `local wallet ${defaultWalletName}`, network, url, body, options, { asset });
+                for await (const { signature, network, asset, payment } of createPaymentSignatures(response, url)) {
+                  const result = await this._x402Retry(signature, `local wallet ${defaultWalletName}`, network, url, body, options, { asset, provider: 'local', decision: payment });
                   if (result !== X402_PAYMENT_REJECTED) return result;
                   // This payment option was cleanly rejected without settling, try next
                 }
@@ -1182,11 +1224,11 @@ export class NansenAPI {
                 if (paymentRequirements) {
                   try {
                     const { createWalletConnectPaymentSignatures } = await import('./walletconnect-x402.js');
-                    for await (const { signature, network } of createWalletConnectPaymentSignatures(paymentRequirements)) {
+                    for await (const { signature, network, payment } of createWalletConnectPaymentSignatures(paymentRequirements)) {
                       // The network is only logged: the post-payment balance
                       // warning reads the local default wallet, not the
                       // WalletConnect account, so it is skipped here.
-                      const result = await this._x402Retry(signature, 'WalletConnect', network, url, body, options, { checkBalance: false });
+                      const result = await this._x402Retry(signature, 'WalletConnect', network, url, body, options, { checkBalance: false, provider: 'walletconnect', decision: payment });
                       if (result !== X402_PAYMENT_REJECTED) return result;
                       // Cleanly rejected without settling, try the next option
                     }
