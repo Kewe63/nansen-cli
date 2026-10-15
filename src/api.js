@@ -33,6 +33,19 @@ export const RESPONSE_META = Symbol('nansenResponseMeta');
  */
 export const X402_PAYMENT_REJECTED = Symbol('x402PaymentRejected');
 
+/**
+ * True when an x402 rejection body carries a reason code for an underfunded
+ * payer, e.g. "insufficient_funds" or "invalid_exact_evm_insufficient_balance".
+ * Only the machine-readable reason fields are read, so free text elsewhere in
+ * the body (such as an accepts[].description) can't trigger it.
+ */
+function isInsufficientBalanceRejection(data) {
+  if (data === null || typeof data !== 'object') return false;
+  return [data.error, data.invalidReason].some(
+    reason => typeof reason === 'string' && /insufficient_(funds|balance)\b/i.test(reason),
+  );
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export function telemetryHeaders() {
@@ -781,21 +794,29 @@ export class NansenAPI {
    * parsed. In all of those cases the server may already have received and
    * settled the payment, so the caller must not treat it as safe to retry with
    * a different option — that would risk paying twice for the same request.
-   * Logs the payment and warns about low balance when walletLabel and network are given.
+   * Logs the payment when walletLabel is given, and warns about low balance
+   * when network is given and checkBalance is true. A rejection whose reason
+   * code says the payer is underfunded is reported on stderr before the
+   * sentinel is returned.
    *
    * @param {string} signature - Payment-Signature header value
    * @param {string|null} walletLabel - Display label for logging, e.g. "local wallet alice"
-   * @param {string|null} network - x402 network string for balance check, e.g. "eip155:8453"
+   * @param {string|null} network - x402 network string the payment was signed for, e.g. "eip155:8453"
    * @param {string} url - Request URL
    * @param {object} body - Request body (will be cleaned)
    * @param {object} [options={}] - Request options (may include .method, .headers)
+   * @param {object} [payment={}]
+   * @param {string|null} [payment.asset=null] - Token the payment used, for the balance check
+   * @param {boolean} [payment.checkBalance=true] - Whether the local default wallet's
+   *   balance reflects this payment. False for WalletConnect, which pays from an
+   *   external account the low-balance warning cannot read.
    * @returns {Promise<object|typeof X402_PAYMENT_REJECTED>}
    *
    * TODO: full fix — extract the entire x402 provider dispatch from request() into
    * an attemptX402Payment() method so adding a new payment provider only requires
    * touching that one method, not hunting inside the retry loop.
    */
-  async _x402Retry(signature, walletLabel, network, url, body, options = {}, asset = null) {
+  async _x402Retry(signature, walletLabel, network, url, body, options = {}, { asset = null, checkBalance = true } = {}) {
     // Mirror request(): paid retries must use the original method. Hardcoding
     // POST burned a payment signature then hit the wrong route for GET/DELETE/PATCH.
     const method = options.method || 'POST';
@@ -862,12 +883,19 @@ export class NansenAPI {
           ErrorCode.PAYMENT_AMBIGUOUS,
         );
       }
+      let rejection;
       try {
-        await paidResponse.json();
+        rejection = await paidResponse.json();
       } catch (err) {
         throw new NansenError(
           `x402 payment outcome unknown: rejection response body was unreadable (${err.message}). Not attempting another payment for the same request.`,
           ErrorCode.PAYMENT_AMBIGUOUS,
+        );
+      }
+      if (isInsufficientBalanceRejection(rejection)) {
+        console.error(
+          `[x402] Payment rejected: ${walletLabel || 'the paying wallet'} has an insufficient token balance` +
+          `${network ? ` on ${network}` : ''}. Fund it on that network or use another payment option.`,
         );
       }
       return X402_PAYMENT_REJECTED;
@@ -875,7 +903,7 @@ export class NansenAPI {
     if (walletLabel) {
       console.error(`[x402] Paid via ${walletLabel}${network ? ` (${network})` : ''}`);
     }
-    if (network) {
+    if (network && checkBalance) {
       try {
         const { checkX402Balance } = await import('./x402.js');
         const result = await checkX402Balance(network, asset);
@@ -1106,7 +1134,7 @@ export class NansenAPI {
               try {
                 const { createPrivyPaymentSignatures } = await import('./privy.js');
                 for await (const { signature, network, asset } of createPrivyPaymentSignatures(response, url)) {
-                  const result = await this._x402Retry(signature, `Privy wallet ${defaultWalletName}`, network, url, body, options, asset);
+                  const result = await this._x402Retry(signature, `Privy wallet ${defaultWalletName}`, network, url, body, options, { asset });
                   if (result !== X402_PAYMENT_REJECTED) return result;
                 }
               } catch (privyErr) {
@@ -1123,7 +1151,7 @@ export class NansenAPI {
               try {
                 const { createPaymentSignatures } = await import('./x402.js');
                 for await (const { signature, network, asset } of createPaymentSignatures(response, url)) {
-                  const result = await this._x402Retry(signature, `local wallet ${defaultWalletName}`, network, url, body, options, asset);
+                  const result = await this._x402Retry(signature, `local wallet ${defaultWalletName}`, network, url, body, options, { asset });
                   if (result !== X402_PAYMENT_REJECTED) return result;
                   // This payment option was cleanly rejected without settling, try next
                 }
@@ -1154,10 +1182,11 @@ export class NansenAPI {
                 if (paymentRequirements) {
                   try {
                     const { createWalletConnectPaymentSignatures } = await import('./walletconnect-x402.js');
-                    for await (const { signature } of createWalletConnectPaymentSignatures(paymentRequirements)) {
-                      // No network: the post-payment balance warning reads the
-                      // local default wallet, not the WalletConnect account.
-                      const result = await this._x402Retry(signature, 'WalletConnect', null, url, body, options);
+                    for await (const { signature, network } of createWalletConnectPaymentSignatures(paymentRequirements)) {
+                      // The network is only logged: the post-payment balance
+                      // warning reads the local default wallet, not the
+                      // WalletConnect account, so it is skipped here.
+                      const result = await this._x402Retry(signature, 'WalletConnect', network, url, body, options, { checkBalance: false });
                       if (result !== X402_PAYMENT_REJECTED) return result;
                       // Cleanly rejected without settling, try the next option
                     }

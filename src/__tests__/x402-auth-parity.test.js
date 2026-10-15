@@ -194,6 +194,15 @@ it('tries the next WalletConnect option after the server cleanly rejects the fir
   expect(fetch).toHaveBeenCalledTimes(3);
 });
 
+it('logs the network a WalletConnect payment used without checking the local wallet balance', async () => {
+  mocks.wallets.mockReturnValue({ wallets: [] });
+  const fetch = vi.fn().mockResolvedValueOnce(paymentResponse()).mockResolvedValueOnce(new Response('{"paid":true}'));
+  vi.stubGlobal('fetch', fetch);
+  await client('anonymous').api.request(endpoint);
+  expect(console.error).toHaveBeenCalledWith('[x402] Paid via WalletConnect (eip155:8453)');
+  expect(mocks.balance).not.toHaveBeenCalled();
+});
+
 it('checks the balance of the token a Privy wallet paid with', async () => {
   mocks.provider.mockReturnValue('privy');
   const usd1 = '0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d';
