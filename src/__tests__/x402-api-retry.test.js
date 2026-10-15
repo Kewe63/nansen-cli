@@ -42,6 +42,7 @@ describe('NansenAPI._x402Retry', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it('returns the X402_PAYMENT_REJECTED sentinel for a readable, non-5xx rejection', async () => {
@@ -58,6 +59,42 @@ describe('NansenAPI._x402Retry', () => {
       'test-sig', null, null, 'https://api.nansen.ai/test', {},
     );
     expect(result).toBe(X402_PAYMENT_REJECTED);
+  });
+
+  it.each(['insufficient_funds', 'invalid_exact_evm_insufficient_balance'])(
+    'reports a %s rejection as an insufficient balance and still returns the sentinel',
+    async (reason) => {
+      mockFetch.mockResolvedValue({ ok: false, status: 402, json: async () => ({ error: reason }) });
+      const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const result = await makeApi()._x402Retry(
+        'test-sig', 'local wallet alice', 'eip155:8453', 'https://api.nansen.ai/test', {},
+      );
+      expect(result).toBe(X402_PAYMENT_REJECTED);
+      expect(stderr).toHaveBeenCalledWith(
+        '[x402] Payment rejected: local wallet alice has an insufficient token balance on eip155:8453. Fund it on that network or use another payment option.',
+      );
+    },
+  );
+
+  it('reads the invalidReason field for an insufficient-balance rejection', async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 402, json: async () => ({ invalidReason: 'insufficient_funds' }) });
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await makeApi()._x402Retry('test-sig', null, null, 'https://api.nansen.ai/test', {});
+    expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/the paying wallet has an insufficient token balance\. /));
+  });
+
+  it('does not report an insufficient balance from free text outside the reason fields', async () => {
+    mockFetch.mockResolvedValue({
+      ok: false,
+      status: 402,
+      json: async () => ({ error: 'payment rejected', accepts: [{ description: 'insufficient_funds? top up' }] }),
+    });
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await makeApi()._x402Retry('test-sig', null, 'eip155:8453', 'https://api.nansen.ai/test', {});
+    expect(stderr).not.toHaveBeenCalled();
   });
 
   it('throws PAYMENT_AMBIGUOUS on a 5xx after the payment was transmitted (issue #583)', async () => {
