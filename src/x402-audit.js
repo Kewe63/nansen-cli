@@ -7,8 +7,9 @@
  *
  * Writes are best-effort: a failure warns once on stderr and never blocks a
  * payment. The log is for auditing; it is not a safety control. A symlinked or
- * hard-linked log, or a symlinked x402 directory, is refused rather than
- * followed, so records never land in (or re-permission) another file.
+ * hard-linked log, or a symlinked ~/.nansen or x402 directory, is refused
+ * rather than followed, so records never land in (or re-permission) another
+ * file.
  */
 
 import crypto from 'node:crypto';
@@ -56,17 +57,63 @@ function tightenIfOpen(fd, mode) {
 
 /**
  * Tighten the x402 directory to 0700 through a descriptor opened without
- * following symlinks, so a swapped-in link can't redirect the chmod.
+ * following symlinks, and only when it is still the directory `expected`
+ * (checked before the log was opened), so a swapped-in link at the x402
+ * directory or ~/.nansen can't redirect the chmod.
  */
-function tightenDirectory(dir) {
+function tightenDirectory(dir, expected) {
   if (process.platform === 'win32') return;
   const { O_RDONLY, O_DIRECTORY, O_NOFOLLOW } = fs.constants;
   const fd = fs.openSync(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
   try {
+    const opened = fs.fstatSync(fd);
+    if (opened.dev !== expected.dev || opened.ino !== expected.ino) {
+      throw new Error(`refusing ${dir}: directory was replaced while writing`);
+    }
     tightenIfOpen(fd, 0o700);
   } finally {
     fs.closeSync(fd);
   }
+}
+
+/**
+ * Run `fn` with a umask of 077, so the paths it creates are exactly 0700/0600
+ * whatever the user's umask. A umask such as 0277 would otherwise create a
+ * 0500 directory or 0400 file that later records can't be written to.
+ * The umask is process-wide, so anything another thread creates in this short
+ * synchronous window is only made more private, never less.
+ */
+function withPrivateUmask(fn) {
+  let previous;
+  try {
+    previous = process.umask(0o077);
+  } catch {
+    // Worker threads can't change the umask; fall back to the user's.
+    return fn();
+  }
+  try {
+    return fn();
+  } finally {
+    process.umask(previous);
+  }
+}
+
+/**
+ * Create `dir` if missing (its parent must exist) and refuse anything other
+ * than a real directory, so a symlink is never followed into another tree.
+ * Returns its lstat.
+ */
+function ensureDirectory(dir) {
+  try {
+    fs.mkdirSync(dir, { mode: 0o700 });
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err;
+  }
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory()) {
+    throw new Error(`refusing ${dir}: expected a directory without symlinks`);
+  }
+  return stat;
 }
 
 /**
@@ -105,15 +152,21 @@ export function appendPaymentRecord(record) {
   try {
     file = x402AuditLogPath();
     const dir = path.dirname(file);
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const nansenDir = path.dirname(dir);
     const { O_RDWR, O_APPEND, O_CREAT } = fs.constants;
-    // Refuses a symlink or hard link at the log or the x402 directory, and a
-    // path swapped while opening.
-    fd = openLocalFile(file, { root: path.dirname(dir), flags: O_RDWR | O_APPEND | O_CREAT, mode: 0o600 });
+    let dirStat;
+    fd = withPrivateUmask(() => {
+      ensureDirectory(nansenDir);
+      dirStat = ensureDirectory(dir);
+      // Rooted at the home directory, which may itself be a symlink (as /var
+      // is on macOS). Refuses a symlink or hard link at the log, a symlinked
+      // ~/.nansen or x402 directory, and a path swapped while opening.
+      return openLocalFile(file, { root: path.dirname(nansenDir), flags: O_RDWR | O_APPEND | O_CREAT, mode: 0o600 });
+    });
     // The open mode only applies when the file is created; tighten an
     // existing file too. Records are never written to a file others can read.
     tightenIfOpen(fd, 0o600);
-    tightenDirectory(dir);
+    tightenDirectory(dir, dirStat);
     const line = `${JSON.stringify({ timestamp: new Date().toISOString(), ...record })}\n`;
     appendAll(fd, endsMidLine(fd) ? `\n${line}` : line);
   } catch (err) {

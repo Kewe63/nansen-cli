@@ -54,6 +54,35 @@ describe('x402 payment audit log', () => {
     expect(mode(x402AuditLogPath())).toBe(0o600);
   });
 
+  describe.runIf(posix)('under a umask that removes owner write access', () => {
+    let previousUmask;
+    const restrictUmask = () => { previousUmask = process.umask(0o277); };
+    afterEach(() => { if (previousUmask !== undefined) process.umask(previousUmask); previousUmask = undefined; });
+
+    it('still creates the directories as 0700 and the file as 0600, and keeps recording', () => {
+      restrictUmask();
+      appendPaymentRecord({ id: 'a', event: 'signed' });
+      appendPaymentRecord({ id: 'a', event: 'accepted' });
+
+      expect(mode(path.join(home, '.nansen'))).toBe(0o700);
+      expect(mode(path.dirname(x402AuditLogPath()))).toBe(0o700);
+      expect(mode(x402AuditLogPath())).toBe(0o600);
+      expect(readRecords().map(r => r.event)).toEqual(['signed', 'accepted']);
+      expect(process.umask()).toBe(0o277);
+    });
+
+    it('creates the file as 0600 in an existing directory, and keeps recording', () => {
+      fs.mkdirSync(path.dirname(x402AuditLogPath()), { recursive: true, mode: 0o700 });
+      restrictUmask();
+
+      appendPaymentRecord({ id: 'a', event: 'signed' });
+      appendPaymentRecord({ id: 'a', event: 'accepted' });
+
+      expect(mode(x402AuditLogPath())).toBe(0o600);
+      expect(readRecords().map(r => r.event)).toEqual(['signed', 'accepted']);
+    });
+  });
+
   it.runIf(posix)('tightens an existing file and directory with looser permissions', () => {
     const file = x402AuditLogPath();
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o755 });
@@ -105,6 +134,20 @@ describe('x402 payment audit log', () => {
 
     expect(fs.readdirSync(target)).toEqual([]);
     expect(mode(target)).toBe(0o755);
+    expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/could not write the payment audit log .*symlinks/));
+  });
+
+  it.runIf(posix)('refuses a symlinked ~/.nansen directory and leaves the link target untouched', () => {
+    const target = fs.mkdtempSync(path.join(home, 'elsewhere-'));
+    fs.mkdirSync(path.join(target, 'x402'));
+    fs.chmodSync(path.join(target, 'x402'), 0o755);
+    fs.symlinkSync(target, path.join(home, '.nansen'));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() => appendPaymentRecord({ id: 'a', event: 'signed' })).not.toThrow();
+
+    expect(fs.readdirSync(path.join(target, 'x402'))).toEqual([]);
+    expect(mode(path.join(target, 'x402'))).toBe(0o755);
     expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/could not write the payment audit log .*symlinks/));
   });
 
