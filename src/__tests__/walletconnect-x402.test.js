@@ -271,6 +271,16 @@ describe('createWalletConnectPaymentSignatures — option fallback', () => {
     expect(hasSufficientEvmPaymentBalance).toHaveBeenCalledWith(expect.objectContaining({ asset: U }), '0xBscAddress');
   });
 
+  it('yields the policy decision that approved each option', async () => {
+    const decision = { ok: true, usd: 0.01, symbol: 'USD1', network: 'eip155:56', asset: USD1, payTo: '0xRecipient', amountRaw: '10000000000000000' };
+    evaluatePaymentRequirement.mockReturnValue(decision);
+
+    const items = await collect([bsc(USD1)]);
+
+    expect(items).toHaveLength(1);
+    expect(items[0].payment).toEqual(decision);
+  });
+
   it('offers the next option after the server rejects the first', async () => {
     const generator = createWalletConnectPaymentSignatures({ accepts: [bsc(U), bsc(USD1)] });
     expect((await generator.next()).value.asset).toBe(U);

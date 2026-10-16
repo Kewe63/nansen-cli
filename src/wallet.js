@@ -1255,6 +1255,10 @@ ENVIRONMENT:
   NANSEN_X402_MAX_AMOUNT    Max USD per x402 auto-payment (default 1.00; "unlimited" to disable)
   NANSEN_X402_ALLOWED_PAYTO Comma-separated recipient allowlist for x402 auto-payment (optional)
 
+x402 auto-payments are recorded in ~/.nansen/x402/payments.jsonl (amount, network,
+asset, recipient, request path and outcome; never signatures, request bodies or
+query strings).
+
 EXAMPLES:
   NANSEN_WALLET_PASSWORD=mypass nansen wallet create --name trading
   nansen wallet create --name agent-wallet --provider privy

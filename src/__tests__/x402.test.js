@@ -391,7 +391,12 @@ describe('createPaymentSignatures — policy guard integration', () => {
       results.push(item);
     }
 
-    expect(results).toEqual([{ signature: 'fake-sig-ok', network: 'eip155:8453', asset: evm.asset }]);
+    expect(results).toEqual([{
+      signature: 'fake-sig-ok',
+      network: 'eip155:8453',
+      asset: evm.asset,
+      payment: expect.objectContaining({ ok: true, network: 'eip155:8453', asset: evm.asset, payTo: evm.payTo, amountRaw: '10000' }),
+    }]);
     const skipIndex = consoleErrorSpy.mock.calls.findIndex(([line]) =>
       String(line).startsWith('[x402] Skipping solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp option: ')
       && String(line).includes('feePayer is the paying wallet'));
@@ -454,7 +459,12 @@ describe('createPaymentSignatures — policy guard integration', () => {
       results.push(item);
     }
 
-    expect(results).toEqual([{ signature: 'fake-sig-ok', network: 'eip155:8453', asset: evm.asset }]);
+    expect(results).toEqual([{
+      signature: 'fake-sig-ok',
+      network: 'eip155:8453',
+      asset: evm.asset,
+      payment: expect.objectContaining({ ok: true, network: 'eip155:8453', asset: evm.asset, payTo: evm.payTo, amountRaw: '10000' }),
+    }]);
     expect(createSvmSpy).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith(
       expect.stringMatching(/^\[x402\] Skipping solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp option: wallet "test" has no Solana key\. .*nansen wallet create/),

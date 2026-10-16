@@ -152,7 +152,8 @@ function formatPaymentAmount(requirement) {
 
 /**
  * Prepare one option for signing: policy, chain-scoped session, balance,
- * typed data. Returns { fromAddress, typedData } or { error } explaining why
+ * typed data. Returns { fromAddress, typedData, payment } (payment is the
+ * policy decision) or { error } explaining why
  * the option is skipped; `logged` marks an error already reported on stderr.
  */
 async function prepareRequirement(requirement) {
@@ -201,7 +202,7 @@ async function prepareRequirement(requirement) {
   }
 
   try {
-    return { fromAddress, typedData: buildEIP712TypedData({ fromAddress, requirement }) };
+    return { fromAddress, typedData: buildEIP712TypedData({ fromAddress, requirement }), payment: decision };
   } catch (error) {
     return { error };
   }
@@ -270,7 +271,7 @@ async function signRequirement(requirement, fromAddress, typedData, resource) {
  * itself fails.
  *
  * @param {Object} paymentRequirements - Decoded payment requirements from 402 response
- * @returns {AsyncGenerator<{ signature: string, network: string, asset: string }>}
+ * @returns {AsyncGenerator<{ signature: string, network: string, asset: string, payment: object }>}
  */
 export async function* createWalletConnectPaymentSignatures(paymentRequirements) {
   const accepts = paymentRequirements.accepts || paymentRequirements;
@@ -290,7 +291,7 @@ export async function* createWalletConnectPaymentSignatures(paymentRequirements)
   let lastError = null;
   let yielded = false;
   for (const requirement of compatible) {
-    const { fromAddress, typedData, error, logged } = await prepareRequirement(requirement);
+    const { fromAddress, typedData, payment, error, logged } = await prepareRequirement(requirement);
     if (error) {
       if (compatible.length > 1 && !logged) console.error(`[x402] Skipping ${requirement.network} WalletConnect option: ${error.message}`);
       lastError = error;
@@ -298,7 +299,7 @@ export async function* createWalletConnectPaymentSignatures(paymentRequirements)
     }
     const signature = await signRequirement(requirement, fromAddress, typedData, resource);
     yielded = true;
-    yield { signature, network: requirement.network, asset: requirement.asset };
+    yield { signature, network: requirement.network, asset: requirement.asset, payment };
   }
   if (!yielded && lastError) throw lastError;
 }
