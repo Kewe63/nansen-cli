@@ -388,24 +388,33 @@ describe('NansenAPI._x402Retry — payment audit log', () => {
     expect(readRecords()[1]).toMatchObject({ event: 'rejected', httpStatus: 402, reason: 'insufficient_balance' });
   });
 
-  it('keeps a snake_case rejection code but never free text or on-chain identifiers', async () => {
-    const bodies = [
-      { invalidReason: 'invalid_exact_evm_payload_signature' },
-      { error: 'Your payment was declined, contact support@example.com' },
-      { error: '0xBEEFbeefBEEFbeefBEEFbeefBEEFbeefBEEFbeef' },
-      { error: '0xbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef' },
-      { invalidReason: '7UX2i7SucgLMQcfZ75s3VXmZZY4YRUyJN9X1RgfMoDUi' },
-      { error: 'abcdefghij' },
-    ];
-    for (const body of bodies) mockFetch.mockResolvedValueOnce(response(402, body));
+  it.each([
+    'invalid_exact_evm_payload_signature',
+    'expired',
+    'INVALID_SIGNATURE',
+  ])('keeps the rejection code %s', async (code) => {
+    mockFetch.mockResolvedValue(response(402, { invalidReason: code }));
 
-    for (const _ of bodies) await pay();
+    await pay();
 
-    const rejected = readRecords().filter(r => r.event === 'rejected');
-    expect(rejected.map(r => r.reason)).toEqual(['invalid_exact_evm_payload_signature', null, null, null, null, null]);
-    const raw = fs.readFileSync(x402AuditLogPath(), 'utf8');
-    expect(raw).not.toMatch(/0xbeef/i);
-    expect(raw).not.toContain('7UX2i7Suc');
+    expect(readRecords()[1]).toMatchObject({ event: 'rejected', reason: code });
+  });
+
+  it.each([
+    ['free text', 'Your payment was declined, contact support@example.com'],
+    ['a checksummed EVM address', '0xBEEFbeefBEEFbeefBEEFbeefBEEFbeefBEEFbeef'],
+    ['a lowercase EVM address', '0xbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef'],
+    ['bare hex', 'beefbeef0123beefbeef0123beefbeef0123beef'],
+    ['a Solana key starting with a digit', '7UX2i7SucgLMQcfZ75s3VXmZZY4YRUyJN9X1RgfMoDUi'],
+    ['a Solana key starting with a letter', 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'],
+    ['mixed case', 'Invalid_Signature'],
+  ])('never copies %s into the reason', async (_name, value) => {
+    mockFetch.mockResolvedValue(response(402, { error: value }));
+
+    await pay();
+
+    expect(readRecords()[1]).toMatchObject({ event: 'rejected', reason: null });
+    expect(fs.readFileSync(x402AuditLogPath(), 'utf8')).not.toContain(value);
   });
 
   it('marks a non-402 rejection without a code as an unexpected status', async () => {

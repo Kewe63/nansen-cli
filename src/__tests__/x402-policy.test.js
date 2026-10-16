@@ -157,6 +157,10 @@ describe('evaluatePaymentRequirement — allowlist and basic pass', () => {
     });
   });
 
+  it.each(['0x2710', 1e4, ' 10000 '])('normalizes the approved amount %j to decimal base units', (amount) => {
+    expect(evaluatePaymentRequirement({ ...BASE_USDC_REQUIREMENT, amount })).toMatchObject({ ok: true, amountRaw: '10000' });
+  });
+
   it('4. unknown asset on known network → refused (allowlist)', () => {
     const req = { ...BASE_USDC_REQUIREMENT, asset: '0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001' };
     const result = evaluatePaymentRequirement(req);

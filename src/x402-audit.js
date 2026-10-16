@@ -70,6 +70,33 @@ function tightenDirectory(dir) {
 }
 
 /**
+ * Write all of `text` at the end of the log. O_APPEND puts each write at the
+ * current end; a short write (nearly full disk) continues with the rest.
+ */
+function appendAll(fd, text) {
+  const bytes = Buffer.from(text, 'utf8');
+  let offset = 0;
+  while (offset < bytes.length) {
+    const written = fs.writeSync(fd, bytes, offset, bytes.length - offset);
+    if (!written) throw new Error('the disk accepted no more bytes');
+    offset += written;
+  }
+}
+
+/**
+ * True when the log is non-empty and its last byte isn't a newline, i.e. an
+ * earlier write was cut short. The next record then starts on a fresh line
+ * instead of being glued onto the broken one.
+ */
+function endsMidLine(fd) {
+  const { size } = fs.fstatSync(fd);
+  if (size === 0) return false;
+  const last = Buffer.alloc(1);
+  fs.readSync(fd, last, 0, 1, size - 1);
+  return last[0] !== 0x0a;
+}
+
+/**
  * Append one record. Never throws.
  */
 export function appendPaymentRecord(record) {
@@ -79,19 +106,24 @@ export function appendPaymentRecord(record) {
     file = x402AuditLogPath();
     const dir = path.dirname(file);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const { O_WRONLY, O_APPEND, O_CREAT } = fs.constants;
+    const { O_RDWR, O_APPEND, O_CREAT } = fs.constants;
     // Refuses a symlink or hard link at the log or the x402 directory, and a
     // path swapped while opening.
-    fd = openLocalFile(file, { root: path.dirname(dir), flags: O_WRONLY | O_APPEND | O_CREAT, mode: 0o600 });
+    fd = openLocalFile(file, { root: path.dirname(dir), flags: O_RDWR | O_APPEND | O_CREAT, mode: 0o600 });
     // The open mode only applies when the file is created; tighten an
     // existing file too. Records are never written to a file others can read.
     tightenIfOpen(fd, 0o600);
     tightenDirectory(dir);
-    fs.writeSync(fd, `${JSON.stringify({ timestamp: new Date().toISOString(), ...record })}\n`);
+    const line = `${JSON.stringify({ timestamp: new Date().toISOString(), ...record })}\n`;
+    appendAll(fd, endsMidLine(fd) ? `\n${line}` : line);
   } catch (err) {
     if (!warned) {
       warned = true;
-      console.error(`[x402] Warning: could not write the payment audit log${file ? ` ${file}` : ''} (${err.message}). Payments are not blocked.`);
+      // EACCES/EPERM usually means a run under sudo left root-owned files.
+      const hint = file && (err.code === 'EACCES' || err.code === 'EPERM')
+        ? ` If it was created by a run under sudo, take it back with: sudo chown -R "$(id -un)" ${path.dirname(file)}`
+        : '';
+      console.error(`[x402] Warning: could not write the payment audit log${file ? ` ${file}` : ''} (${err.message}). Payments are not blocked.${hint}`);
     }
   } finally {
     if (fd !== undefined) {

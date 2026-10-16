@@ -150,6 +150,45 @@ describe('x402 payment audit log', () => {
     }
   });
 
+  it('finishes a record the disk accepted only part of', () => {
+    const realWrite = fs.writeSync;
+    let first = true;
+    vi.spyOn(fs, 'writeSync').mockImplementation((fd, data, offset = 0, ...rest) => {
+      if (!first) return realWrite(fd, data, offset, ...rest);
+      first = false;
+      // Accept only the first 5 bytes, whichever writeSync signature was used.
+      const bytes = Buffer.isBuffer(data) ? data.subarray(offset, offset + 5) : Buffer.from(data).subarray(0, 5);
+      return realWrite(fd, bytes);
+    });
+
+    appendPaymentRecord({ id: 'a', event: 'signed' });
+
+    expect(readRecords()).toEqual([{ timestamp: expect.any(String), id: 'a', event: 'signed' }]);
+  });
+
+  it('starts a new line after a record an earlier run left unfinished', () => {
+    fs.mkdirSync(path.dirname(x402AuditLogPath()), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(x402AuditLogPath(), '{"id":"a","event":"sig', { mode: 0o600 });
+
+    appendPaymentRecord({ id: 'b', event: 'signed' });
+
+    const lines = fs.readFileSync(x402AuditLogPath(), 'utf8').split('\n');
+    expect(lines[0]).toBe('{"id":"a","event":"sig');
+    expect(JSON.parse(lines[1])).toMatchObject({ id: 'b', event: 'signed' });
+  });
+
+  it.runIf(posix && process.getuid?.() !== 0)('says how to recover a log a sudo run left unwritable', () => {
+    fs.mkdirSync(path.dirname(x402AuditLogPath()), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(x402AuditLogPath(), '', { mode: 0o400 });
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    appendPaymentRecord({ id: 'a', event: 'signed' });
+
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining(
+      `If it was created by a run under sudo, take it back with: sudo chown -R "$(id -un)" ${path.dirname(x402AuditLogPath())}`,
+    ));
+  });
+
   it('generates a distinct id per payment', () => {
     expect(newPaymentId()).not.toBe(newPaymentId());
   });

@@ -129,7 +129,8 @@ export function resolvePayTo(requirement) {
 /**
  * Decide whether an x402 payment requirement is safe to auto-sign.
  * Returns { ok: true, usd, symbol, network, asset, payTo, amountRaw } when
- * allowed (amountRaw is the base-unit amount as a string), or
+ * allowed (amountRaw is the parsed base-unit amount as a decimal string, so
+ * "0x2710" and 1e4 both become "10000"), or
  * { ok: false, reason } with a human-readable, actionable reason when refused.
  *
  * Enforces in order: known (network, asset) allowlist, optional payTo
@@ -180,10 +181,11 @@ export function evaluatePaymentRequirement(requirement) {
   }
 
   let usd;
+  let base;
   try {
     // BigInt base units → USD. Keep integer/fraction split to avoid float loss
     // on large values; final Number() is safe for display-scale amounts.
-    const base = BigInt(amountRaw);
+    base = BigInt(amountRaw);
     // A transfer authorization must be for a positive amount; a negative value
     // is never legitimate and should never be signed.
     if (base < 0n) {
@@ -213,5 +215,5 @@ export function evaluatePaymentRequirement(requirement) {
     };
   }
 
-  return { ok: true, usd, symbol: known.symbol, network, asset, payTo, amountRaw: String(amountRaw) };
+  return { ok: true, usd, symbol: known.symbol, network, asset, payTo, amountRaw: base.toString() };
 }

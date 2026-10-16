@@ -47,18 +47,23 @@ function isInsufficientBalanceRejection(data) {
   );
 }
 
+// A reason code in one letter case: "expired", "invalid_exact_evm_payload_signature",
+// "INVALID_SIGNATURE". Hex and base58 identifiers mix digits and letters in
+// ways this can't match (a lone word has no digits; base58 mixes case), so
+// addresses and account keys are never copied.
+const REASON_CODE = /^(?:[a-z]+(?:_[a-z0-9]+)*|[A-Z]+(?:_[A-Z0-9]+)*)$/;
+
 /**
- * The rejection's reason for the audit log, or null. Only a lowercase
- * snake_case code such as "invalid_exact_evm_payload_signature" is copied, so
- * free text and on-chain identifiers (addresses, account keys) never are. A
- * non-402 status without a code is marked "unexpected_status": the retry still
- * treats it as a rejection, but it is not a payment refusal.
+ * The rejection's reason for the audit log, or null. Only a code matching
+ * REASON_CODE is copied, never free text. A non-402 status without a code is
+ * marked "unexpected_status": the retry still treats it as a rejection, but
+ * it is not a payment refusal.
  */
 function rejectionReasonCode(data, status) {
   if (isInsufficientBalanceRejection(data)) return 'insufficient_balance';
   const code = data !== null && typeof data === 'object'
     ? [data.invalidReason, data.error].find(
-      reason => typeof reason === 'string' && reason.length <= 100 && /^[a-z]+(?:_[a-z0-9]+)+$/.test(reason),
+      reason => typeof reason === 'string' && reason.length <= 100 && REASON_CODE.test(reason),
     )
     : undefined;
   return code ?? (status === 402 ? null : 'unexpected_status');
@@ -851,7 +856,7 @@ export class NansenAPI {
       provider,
       wallet: walletLabel,
       network,
-      asset: decision?.asset ?? asset,
+      asset: decision?.asset ?? null,
       symbol: decision?.symbol ?? null,
       amountUsd: decision?.usd ?? null,
       amountRaw: decision?.amountRaw ?? null,
@@ -935,13 +940,14 @@ export class NansenAPI {
           ErrorCode.PAYMENT_AMBIGUOUS,
         );
       }
-      if (isInsufficientBalanceRejection(rejection)) {
+      const reason = rejectionReasonCode(rejection, paidResponse.status);
+      if (reason === 'insufficient_balance') {
         console.error(
           `[x402] Payment rejected: ${walletLabel || 'the paying wallet'} has an insufficient token balance` +
           `${network ? ` on ${network}` : ''}. Fund it on that network or use another payment option.`,
         );
       }
-      audit('rejected', { ...outcome, reason: rejectionReasonCode(rejection, paidResponse.status) });
+      audit('rejected', { ...outcome, reason });
       return X402_PAYMENT_REJECTED;
     }
     // A 2xx means the payment settled: record it before the balance check and
