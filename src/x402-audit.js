@@ -14,13 +14,17 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { authDirectory } from './auth-credentials.js';
 import { openLocalFile } from './local-file.js';
 
 let warned = false;
 
+/**
+ * Throws when no absolute home directory is known, rather than resolving
+ * against the working directory (which could be a git checkout).
+ */
 export function x402AuditLogPath() {
-  const home = process.env.HOME || process.env.USERPROFILE || '';
-  return path.join(home, '.nansen', 'x402', 'payments.jsonl');
+  return path.join(authDirectory(), 'x402', 'payments.jsonl');
 }
 
 export function newPaymentId() {
@@ -41,6 +45,16 @@ export function sanitizeRequestUrl(url) {
 }
 
 /**
+ * chmod a descriptor to `mode` only when group or other users have access.
+ * A file the user can write but not chmod (owned by another user) is fine
+ * as long as it is already private.
+ */
+function tightenIfOpen(fd, mode) {
+  if (process.platform === 'win32') return;
+  if (fs.fstatSync(fd).mode & 0o077) fs.fchmodSync(fd, mode);
+}
+
+/**
  * Tighten the x402 directory to 0700 through a descriptor opened without
  * following symlinks, so a swapped-in link can't redirect the chmod.
  */
@@ -49,7 +63,7 @@ function tightenDirectory(dir) {
   const { O_RDONLY, O_DIRECTORY, O_NOFOLLOW } = fs.constants;
   const fd = fs.openSync(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
   try {
-    fs.fchmodSync(fd, 0o700);
+    tightenIfOpen(fd, 0o700);
   } finally {
     fs.closeSync(fd);
   }
@@ -59,24 +73,25 @@ function tightenDirectory(dir) {
  * Append one record. Never throws.
  */
 export function appendPaymentRecord(record) {
-  const file = x402AuditLogPath();
-  const dir = path.dirname(file);
+  let file = null;
   let fd;
   try {
+    file = x402AuditLogPath();
+    const dir = path.dirname(file);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const { O_WRONLY, O_APPEND, O_CREAT } = fs.constants;
     // Refuses a symlink or hard link at the log or the x402 directory, and a
     // path swapped while opening.
     fd = openLocalFile(file, { root: path.dirname(dir), flags: O_WRONLY | O_APPEND | O_CREAT, mode: 0o600 });
     // The open mode only applies when the file is created; tighten an
-    // existing file too.
-    fs.fchmodSync(fd, 0o600);
+    // existing file too. Records are never written to a file others can read.
+    tightenIfOpen(fd, 0o600);
     tightenDirectory(dir);
     fs.writeSync(fd, `${JSON.stringify({ timestamp: new Date().toISOString(), ...record })}\n`);
   } catch (err) {
     if (!warned) {
       warned = true;
-      console.error(`[x402] Warning: could not write the payment audit log ${file} (${err.message}). Payments are not blocked.`);
+      console.error(`[x402] Warning: could not write the payment audit log${file ? ` ${file}` : ''} (${err.message}). Payments are not blocked.`);
     }
   } finally {
     if (fd !== undefined) {

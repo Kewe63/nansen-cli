@@ -388,16 +388,36 @@ describe('NansenAPI._x402Retry — payment audit log', () => {
     expect(readRecords()[1]).toMatchObject({ event: 'rejected', httpStatus: 402, reason: 'insufficient_balance' });
   });
 
-  it('keeps a code-shaped rejection reason but never free text', async () => {
-    mockFetch
-      .mockResolvedValueOnce(response(402, { invalidReason: 'invalid_exact_evm_payload_signature' }))
-      .mockResolvedValueOnce(response(402, { error: 'Your payment was declined, contact support@example.com' }));
+  it('keeps a snake_case rejection code but never free text or on-chain identifiers', async () => {
+    const bodies = [
+      { invalidReason: 'invalid_exact_evm_payload_signature' },
+      { error: 'Your payment was declined, contact support@example.com' },
+      { error: '0xBEEFbeefBEEFbeefBEEFbeefBEEFbeefBEEFbeef' },
+      { error: '0xbeefbeefbeefbeefbeefbeefbeefbeefbeefbeef' },
+      { invalidReason: '7UX2i7SucgLMQcfZ75s3VXmZZY4YRUyJN9X1RgfMoDUi' },
+      { error: 'abcdefghij' },
+    ];
+    for (const body of bodies) mockFetch.mockResolvedValueOnce(response(402, body));
 
-    await pay();
+    for (const _ of bodies) await pay();
+
+    const rejected = readRecords().filter(r => r.event === 'rejected');
+    expect(rejected.map(r => r.reason)).toEqual(['invalid_exact_evm_payload_signature', null, null, null, null, null]);
+    const raw = fs.readFileSync(x402AuditLogPath(), 'utf8');
+    expect(raw).not.toMatch(/0xbeef/i);
+    expect(raw).not.toContain('7UX2i7Suc');
+  });
+
+  it('marks a non-402 rejection without a code as an unexpected status', async () => {
+    mockFetch
+      .mockResolvedValueOnce(response(404, { detail: 'Not found' }))
+      .mockResolvedValueOnce(response(400, { error: 'invalid_payload' }));
+
+    expect(await pay()).toBe(X402_PAYMENT_REJECTED);
     await pay();
 
     const rejected = readRecords().filter(r => r.event === 'rejected');
-    expect(rejected.map(r => r.reason)).toEqual(['invalid_exact_evm_payload_signature', null]);
+    expect(rejected.map(r => [r.httpStatus, r.reason])).toEqual([[404, 'unexpected_status'], [400, 'invalid_payload']]);
   });
 
   it.each([
@@ -427,7 +447,15 @@ describe('NansenAPI._x402Retry — payment audit log', () => {
 
     await expect(pay()).rejects.toMatchObject({ code: ErrorCode.PAYMENT_AMBIGUOUS });
 
-    expect(readRecords()[1]).toMatchObject({ event: 'accepted', httpStatus: 200, reason: 'unreadable_response' });
+    expect(readRecords().map(r => r.event)).toEqual(['signed', 'accepted']);
+    expect(readRecords()[1]).toMatchObject({ httpStatus: 200 });
+  });
+
+  it('records acceptance as soon as the 2xx arrives, before the body is read', async () => {
+    mockFetch.mockResolvedValue({ ...response(200, {}), json: () => new Promise(() => {}) });
+
+    pay(); // never settles: the body never arrives
+    await vi.waitFor(() => expect(readRecords().map(r => r.event)).toEqual(['signed', 'accepted']));
   });
 
   it('still completes the payment when the audit log cannot be written', async () => {

@@ -48,16 +48,20 @@ function isInsufficientBalanceRejection(data) {
 }
 
 /**
- * The rejection's machine-readable reason code for the audit log, or null.
- * Free text is never copied: only a short code-shaped value is kept.
+ * The rejection's reason for the audit log, or null. Only a lowercase
+ * snake_case code such as "invalid_exact_evm_payload_signature" is copied, so
+ * free text and on-chain identifiers (addresses, account keys) never are. A
+ * non-402 status without a code is marked "unexpected_status": the retry still
+ * treats it as a rejection, but it is not a payment refusal.
  */
-function rejectionReasonCode(data) {
+function rejectionReasonCode(data, status) {
   if (isInsufficientBalanceRejection(data)) return 'insufficient_balance';
-  if (data === null || typeof data !== 'object') return null;
-  const code = [data.invalidReason, data.error].find(
-    reason => typeof reason === 'string' && /^[\w.:-]{1,100}$/.test(reason),
-  );
-  return code ?? null;
+  const code = data !== null && typeof data === 'object'
+    ? [data.invalidReason, data.error].find(
+      reason => typeof reason === 'string' && reason.length <= 100 && /^[a-z]+(?:_[a-z0-9]+)+$/.test(reason),
+    )
+    : undefined;
+  return code ?? (status === 402 ? null : 'unexpected_status');
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -937,9 +941,12 @@ export class NansenAPI {
           `${network ? ` on ${network}` : ''}. Fund it on that network or use another payment option.`,
         );
       }
-      audit('rejected', { ...outcome, reason: rejectionReasonCode(rejection) });
+      audit('rejected', { ...outcome, reason: rejectionReasonCode(rejection, paidResponse.status) });
       return X402_PAYMENT_REJECTED;
     }
+    // A 2xx means the payment settled: record it before the balance check and
+    // body parse, which can be slow or interrupted.
+    audit('accepted', outcome);
     if (walletLabel) {
       console.error(`[x402] Paid via ${walletLabel}${network ? ` (${network})` : ''}`);
     }
@@ -959,13 +966,11 @@ export class NansenAPI {
       // The payment was accepted (2xx) — it settled. We just can't read the
       // response body, so surface that plainly rather than silently treating
       // it as a rejection and paying again.
-      audit('accepted', { ...outcome, reason: 'unreadable_response' });
       throw new NansenError(
         `x402 payment succeeded but its response body was unreadable (${err.message}). The payment was not repeated.`,
         ErrorCode.PAYMENT_AMBIGUOUS,
       );
     }
-    audit('accepted', outcome);
     const meta = readResponseMeta(paidResponse);
     this.lastResponseMeta = meta;
     if (meta && data !== null && typeof data === 'object') data[RESPONSE_META] = meta;

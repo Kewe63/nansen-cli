@@ -122,6 +122,34 @@ describe('x402 payment audit log', () => {
     expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/could not write the payment audit log .*hard links/));
   });
 
+  it.runIf(posix)('leaves an already-private log and directory alone', () => {
+    appendPaymentRecord({ id: 'a', event: 'signed' });
+    // A file another user owns can be written but not chmod-ed; a private one
+    // must not need a chmod, or every record would be dropped.
+    const fchmod = vi.spyOn(fs, 'fchmodSync');
+
+    appendPaymentRecord({ id: 'a', event: 'accepted' });
+
+    expect(fchmod).not.toHaveBeenCalled();
+    expect(readRecords().map(r => r.event)).toEqual(['signed', 'accepted']);
+  });
+
+  it('never resolves the log against the working directory when no home is known', () => {
+    process.env.HOME = '';
+    const originalProfile = process.env.USERPROFILE;
+    process.env.USERPROFILE = '';
+    vi.spyOn(os, 'homedir').mockReturnValue('');
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => x402AuditLogPath()).toThrow(/absolute home directory/);
+      expect(() => appendPaymentRecord({ id: 'a', event: 'signed' })).not.toThrow();
+      expect(fs.existsSync(path.join(process.cwd(), '.nansen', 'x402'))).toBe(false);
+      expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/^\[x402\] Warning: could not write the payment audit log \(Cannot locate an absolute home directory/));
+    } finally {
+      process.env.USERPROFILE = originalProfile;
+    }
+  });
+
   it('generates a distinct id per payment', () => {
     expect(newPaymentId()).not.toBe(newPaymentId());
   });
