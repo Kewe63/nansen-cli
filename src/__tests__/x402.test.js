@@ -180,6 +180,98 @@ describe('createPaymentSignatures — policy guard integration', () => {
     vi.doUnmock('../wallet.js');
     consoleErrorSpy.mockRestore();
     delete process.env.NANSEN_X402_MAX_AMOUNT;
+    delete process.env.NANSEN_X402_SESSION_MAX_AMOUNT;
+  });
+
+  function mockEvmSigner() {
+    const createEvmSpy = vi.fn().mockReturnValue('fake-sig-ok');
+    vi.doMock('../x402-evm.js', () => ({
+      createEvmPaymentPayload: createEvmSpy,
+      isEvmNetwork: (n) => n.startsWith('eip155:'),
+      PERMIT2_ADDRESS: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+    }));
+    vi.doMock('../x402-svm.js', () => ({
+      createSvmPaymentPayload: vi.fn(),
+      isSvmNetwork: () => false,
+      fetchRecentBlockhash: vi.fn(),
+      getSolanaRpcUrl: vi.fn(),
+    }));
+    return createEvmSpy;
+  }
+
+  async function collectSignatures(createPaymentSignatures, requirement) {
+    const results = [];
+    for await (const item of createPaymentSignatures(makeResponse(requirement), 'https://api.nansen.ai/test')) {
+      results.push(item);
+    }
+    return results;
+  }
+
+  it('12d. session cap: concurrent requests in one process sign only what the cap allows', async () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.02';
+    const createEvmSpy = mockEvmSigner();
+    const { createPaymentSignatures } = await import('../x402.js');
+
+    // Hold every balance check until all three runs are waiting in it, so
+    // they reach the session charge together after every async check.
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    mockFetch.mockImplementation(async () => {
+      await gate;
+      return { json: async () => ({}) };
+    });
+
+    const runs = [];
+    for (let i = 1; i <= 3; i++) {
+      runs.push(collectSignatures(createPaymentSignatures, makeRequirement(10_000n)));
+      await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(i));
+    }
+    release();
+    const results = await Promise.all(runs);
+
+    expect(results.map(r => r.length).sort()).toEqual([0, 1, 1]);
+    expect(createEvmSpy).toHaveBeenCalledTimes(2);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/^\[x402\] Refusing to auto-pay \$0\.01 USDC: this process has already auto-paid \$0\.02, .*NANSEN_X402_SESSION_MAX_AMOUNT=<usd>/),
+    );
+
+    vi.doUnmock('../x402-evm.js');
+    vi.doUnmock('../x402-svm.js');
+  });
+
+  it('12e. session cap: an option skipped before signing is not charged', async () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.01';
+    const createEvmSpy = mockEvmSigner();
+    const { createPaymentSignatures } = await import('../x402.js');
+
+    // A zero token balance skips the option at the balance check.
+    mockFetch.mockResolvedValue({ json: async () => ({ result: '0x0' }) });
+    expect(await collectSignatures(createPaymentSignatures, makeRequirement(10_000n))).toHaveLength(0);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('insufficient token balance'));
+
+    mockFetch.mockResolvedValue({ json: async () => ({}) });
+    expect(await collectSignatures(createPaymentSignatures, makeRequirement(10_000n))).toHaveLength(1);
+    expect(createEvmSpy).toHaveBeenCalledTimes(1);
+
+    vi.doUnmock('../x402-evm.js');
+    vi.doUnmock('../x402-svm.js');
+  });
+
+  it('12f. session cap: a signer that throws does not use up the cap', async () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.01';
+    const createEvmSpy = mockEvmSigner();
+    createEvmSpy.mockImplementationOnce(() => { throw new Error('requirements.extra.name is required'); });
+    const { createPaymentSignatures } = await import('../x402.js');
+    mockFetch.mockResolvedValue({ json: async () => ({}) });
+
+    expect(await collectSignatures(createPaymentSignatures, makeRequirement(10_000n))).toHaveLength(0);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('requirements.extra.name is required'));
+
+    expect(await collectSignatures(createPaymentSignatures, makeRequirement(10_000n))).toHaveLength(1);
+    expect(createEvmSpy).toHaveBeenCalledTimes(2);
+
+    vi.doUnmock('../x402-evm.js');
+    vi.doUnmock('../x402-svm.js');
   });
 
   it('11. over-cap amount → yields nothing, logs refusal, createEvmPaymentPayload not called', async () => {
@@ -396,6 +488,7 @@ describe('createPaymentSignatures — policy guard integration', () => {
       network: 'eip155:8453',
       asset: evm.asset,
       payment: expect.objectContaining({ ok: true, network: 'eip155:8453', asset: evm.asset, payTo: evm.payTo, amountRaw: '10000' }),
+      releaseCharge: expect.any(Function),
     }]);
     const skipIndex = consoleErrorSpy.mock.calls.findIndex(([line]) =>
       String(line).startsWith('[x402] Skipping solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp option: ')
@@ -464,6 +557,7 @@ describe('createPaymentSignatures — policy guard integration', () => {
       network: 'eip155:8453',
       asset: evm.asset,
       payment: expect.objectContaining({ ok: true, network: 'eip155:8453', asset: evm.asset, payTo: evm.payTo, amountRaw: '10000' }),
+      releaseCharge: expect.any(Function),
     }]);
     expect(createSvmSpy).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith(

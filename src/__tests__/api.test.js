@@ -4194,6 +4194,141 @@ describe('NansenAPI', () => {
         vi.doUnmock('../walletconnect-x402.js');
       });
     });
+
+    describe('session spend cap', () => {
+      const paymentHeader = btoa(JSON.stringify({
+        accepts: [{ scheme: 'exact', asset: '0xUSDC', payTo: '0xR', amount: '10000', network: 'base', extra: { name: 'X', version: '1', chainId: 1 } }],
+      }));
+      const paymentRequired = () => ({
+        ok: false,
+        status: 402,
+        json: async () => ({ message: 'Payment required' }),
+        headers: { get: (h) => h === 'payment-required' ? paymentHeader : null },
+      });
+
+      afterEach(() => {
+        delete process.env.NANSEN_X402_SESSION_MAX_AMOUNT;
+        vi.doUnmock('../x402.js');
+        vi.doUnmock('../walletconnect-x402.js');
+      });
+
+      async function requestError(api) {
+        try {
+          await api.smartMoneyNetflow({});
+        } catch (err) {
+          return err;
+        }
+        throw new Error('expected the request to fail');
+      }
+
+      it('reports a session-cap refusal instead of a generic payment failure', async () => {
+        if (LIVE_TEST) return;
+        const reason = 'Refusing to auto-pay $0.01 USDC: this process has already auto-paid $0.01, and the payment would exceed the $0.01 session cap.';
+        mockFetch.mockResolvedValueOnce(paymentRequired());
+        vi.resetModules();
+        vi.doMock('../x402.js', () => ({
+          createPaymentSignatures: async function* (_response, _url, options) { options.onCapRefusal(reason); yield* []; },
+          checkX402Balance: vi.fn().mockResolvedValue(null),
+        }));
+        vi.doMock('../walletconnect-x402.js', () => ({
+          createWalletConnectPaymentSignatures: async function* () { yield* []; throw new Error('No WalletConnect session'); },
+        }));
+        const { NansenAPI: FreshAPI, ErrorCode: FreshErrorCode } = await import('../api.js');
+
+        const err = await requestError(new FreshAPI(null, 'https://api.nansen.ai'));
+
+        expect(err.code).toBe(FreshErrorCode.PAYMENT_REQUIRED);
+        expect(err.message).toBe(reason);
+      });
+
+      it('reports an invalid session cap once, before any wallet or network work', async () => {
+        if (LIVE_TEST) return;
+        process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0x10';
+        mockFetch.mockResolvedValueOnce(paymentRequired());
+        const localSignatures = vi.fn();
+        const wcSignaturesSpy = vi.fn();
+        vi.resetModules();
+        vi.doMock('../x402.js', () => ({ createPaymentSignatures: localSignatures, checkX402Balance: vi.fn() }));
+        vi.doMock('../walletconnect-x402.js', () => ({ createWalletConnectPaymentSignatures: wcSignaturesSpy }));
+        const { NansenAPI: FreshAPI } = await import('../api.js');
+
+        const err = await requestError(new FreshAPI(null, 'https://api.nansen.ai'));
+
+        expect(err.message).toContain('NANSEN_X402_SESSION_MAX_AMOUNT="0x10" is not a valid USD amount');
+        expect(localSignatures).not.toHaveBeenCalled();
+        expect(wcSignaturesSpy).not.toHaveBeenCalled();
+        expect(mockFetch).toHaveBeenCalledTimes(1);
+      });
+
+      it('releases the charge for a cleanly rejected option and keeps it for the accepted one', async () => {
+        if (LIVE_TEST) return;
+        const successData = { netflows: [] };
+        mockFetch
+          .mockResolvedValueOnce(paymentRequired())
+          .mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({ error: 'invalid_payment' }), headers: { get: () => null } })
+          .mockResolvedValueOnce({ ok: true, status: 200, json: async () => successData, text: async () => JSON.stringify(successData), headers: { get: () => null } });
+        const releaseRejected = vi.fn();
+        const releaseAccepted = vi.fn();
+        vi.resetModules();
+        vi.doMock('../x402.js', () => ({
+          createPaymentSignatures: async function* () {
+            yield { signature: 'sig-base', network: 'eip155:8453', asset: '0xUSDC', releaseCharge: releaseRejected };
+            yield { signature: 'sig-sol', network: 'solana:mainnet', asset: 'USDC', releaseCharge: releaseAccepted };
+          },
+          checkX402Balance: vi.fn().mockResolvedValue(null),
+        }));
+        const { NansenAPI: FreshAPI } = await import('../api.js');
+
+        await expect(new FreshAPI(null, 'https://api.nansen.ai').smartMoneyNetflow({})).resolves.toBeDefined();
+
+        expect(releaseRejected).toHaveBeenCalledTimes(1);
+        expect(releaseAccepted).not.toHaveBeenCalled();
+      });
+
+      it('keeps the charge when the paid retry outcome is ambiguous', async () => {
+        if (LIVE_TEST) return;
+        mockFetch
+          .mockResolvedValueOnce(paymentRequired())
+          .mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({ error: 'internal error' }), headers: { get: () => null } });
+        const releaseCharge = vi.fn();
+        vi.resetModules();
+        vi.doMock('../x402.js', () => ({
+          createPaymentSignatures: async function* () {
+            yield { signature: 'sig-base', network: 'eip155:8453', asset: '0xUSDC', releaseCharge };
+          },
+          checkX402Balance: vi.fn().mockResolvedValue(null),
+        }));
+        const { NansenAPI: FreshAPI, ErrorCode: FreshErrorCode } = await import('../api.js');
+
+        const err = await requestError(new FreshAPI(null, 'https://api.nansen.ai'));
+
+        expect(err.code).toBe(FreshErrorCode.PAYMENT_AMBIGUOUS);
+        expect(releaseCharge).not.toHaveBeenCalled();
+      });
+
+      it('does not blame the cap once a payment was sent and rejected', async () => {
+        if (LIVE_TEST) return;
+        mockFetch
+          .mockResolvedValueOnce(paymentRequired())
+          .mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({ error: 'invalid_payment' }), headers: { get: () => null } });
+        vi.resetModules();
+        vi.doMock('../x402.js', () => ({
+          createPaymentSignatures: async function* (_response, _url, options) {
+            options.onCapRefusal('Refusing to auto-pay $5.00 USDC: ... session cap.');
+            yield { signature: 'sig-cheap', network: 'eip155:8453', asset: '0xUSDC', releaseCharge: vi.fn() };
+          },
+          checkX402Balance: vi.fn().mockResolvedValue(null),
+        }));
+        vi.doMock('../walletconnect-x402.js', () => ({
+          createWalletConnectPaymentSignatures: async function* () { yield* []; throw new Error('No WalletConnect session'); },
+        }));
+        const { NansenAPI: FreshAPI } = await import('../api.js');
+
+        const err = await requestError(new FreshAPI(null, 'https://api.nansen.ai'));
+
+        expect(err.message).not.toContain('session cap');
+      });
+    });
   });
 
   // =================== Smart Alert Endpoints ===================

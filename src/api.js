@@ -1166,7 +1166,20 @@ export class NansenAPI {
             }
           }
 
+          // When the session cap stopped every payment, its reason outranks
+          // the generic payment failure below: the fix is to raise the cap, not
+          // to change credentials. Once a payment was sent, its own outcome is
+          // the better explanation. An invalid cap refuses every payment, so
+          // check it once before any wallet or network work.
+          let capRefusal = null;
+          let paymentSent = false;
+          const onCapRefusal = (reason) => { capRefusal = reason; };
           if (mayAutoPay && !hasManualSignature) {
+            const { sessionCapConfigError } = await import('./x402-policy.js');
+            capRefusal = sessionCapConfigError();
+          }
+
+          if (mayAutoPay && !hasManualSignature && !capRefusal) {
             // Determine payment method from default wallet's provider
             let defaultWalletProvider = 'local';
             let defaultWalletName = 'unknown';
@@ -1186,9 +1199,12 @@ export class NansenAPI {
               // Default wallet is Privy: sign via Privy
               try {
                 const { createPrivyPaymentSignatures } = await import('./privy.js');
-                for await (const { signature, network, asset, payment } of createPrivyPaymentSignatures(response, url)) {
+                for await (const { signature, network, asset, payment, releaseCharge } of createPrivyPaymentSignatures(response, url, { onCapRefusal })) {
+                  paymentSent = true;
                   const result = await this._x402Retry(signature, `Privy wallet ${defaultWalletName}`, network, url, body, options, { asset, provider: 'privy', decision: payment });
                   if (result !== X402_PAYMENT_REJECTED) return result;
+                  // A clean rejection settled nothing, so it doesn't count against the session cap.
+                  releaseCharge();
                 }
               } catch (privyErr) {
                 // An ambiguous outcome (transport failure, 5xx, unreadable body)
@@ -1203,10 +1219,13 @@ export class NansenAPI {
               // 1. Try local wallet with fallback across payment networks
               try {
                 const { createPaymentSignatures } = await import('./x402.js');
-                for await (const { signature, network, asset, payment } of createPaymentSignatures(response, url)) {
+                for await (const { signature, network, asset, payment, releaseCharge } of createPaymentSignatures(response, url, { onCapRefusal })) {
+                  paymentSent = true;
                   const result = await this._x402Retry(signature, `local wallet ${defaultWalletName}`, network, url, body, options, { asset, provider: 'local', decision: payment });
                   if (result !== X402_PAYMENT_REJECTED) return result;
-                  // This payment option was cleanly rejected without settling, try next
+                  // This payment option was cleanly rejected without settling, so it
+                  // doesn't count against the session cap. Try the next one.
+                  releaseCharge();
                 }
               } catch (localErr) {
                 // An ambiguous outcome here means a signed payment may already
@@ -1235,13 +1254,16 @@ export class NansenAPI {
                 if (paymentRequirements) {
                   try {
                     const { createWalletConnectPaymentSignatures } = await import('./walletconnect-x402.js');
-                    for await (const { signature, network, payment } of createWalletConnectPaymentSignatures(paymentRequirements)) {
+                    for await (const { signature, network, payment, releaseCharge } of createWalletConnectPaymentSignatures(paymentRequirements, { onCapRefusal })) {
                       // The network is only logged: the post-payment balance
                       // warning reads the local default wallet, not the
                       // WalletConnect account, so it is skipped here.
+                      paymentSent = true;
                       const result = await this._x402Retry(signature, 'WalletConnect', network, url, body, options, { checkBalance: false, provider: 'walletconnect', decision: payment });
                       if (result !== X402_PAYMENT_REJECTED) return result;
-                      // Cleanly rejected without settling, try the next option
+                      // Cleanly rejected without settling, so it doesn't count
+                      // against the session cap. Try the next option.
+                      releaseCharge();
                     }
                   } catch (x402Err) {
                     // WalletConnect is the last resort in this chain — an
@@ -1260,6 +1282,8 @@ export class NansenAPI {
               }
             }
           }
+
+          if (capRefusal && !paymentSent) message = capRefusal;
 
           if ((mayAutoPay || hasManualSignature) && (!message || message === data.message)) {
             message = 'Payment required (x402). Sign the paymentRequirements below per https://docs.x402.org and pass the result with --x402-payment-signature <value>.';
