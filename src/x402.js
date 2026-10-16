@@ -14,7 +14,7 @@ import {
 import { resolvePassword } from './keychain.js';
 import { EVM_X402_RPCS, hasSufficientEvmPaymentBalance, hasSufficientSvmPaymentBalance } from './x402-payment-balance.js';
 export { EVM_X402_RPCS } from './x402-payment-balance.js';
-import { chargeSessionSpend, evaluatePaymentRequirement, resolvePaymentAmount } from './x402-policy.js';
+import { evaluatePaymentRequirement, resolvePaymentAmount, signWithSessionCharge } from './x402-policy.js';
 import { EVM_X402_TOKENS } from './x402-tokens.js';
 export { EVM_X402_TOKENS } from './x402-tokens.js';
 
@@ -112,43 +112,40 @@ async function hasPermit2Allowance(network, token, owner, amount) {
 
 /**
  * Build a payment signature for a single requirement.
- * @returns {Promise<{ signature: string, payment: object }|null>} Base64 payment
- *   signature and the policy decision that approved it, or null on failure
+ * @returns {Promise<{ signature: string, payment: object, releaseCharge: Function }|null>}
+ *   Base64 payment signature, the policy decision that approved it and the
+ *   release for its session-cap charge, or null on failure
  */
-async function buildPaymentForRequirement(requirement, exported, url) {
+async function buildPaymentForRequirement(requirement, exported, url, onCapRefusal) {
   const decision = evaluatePaymentRequirement(requirement);
   if (!decision.ok) {
     console.error(`[x402] ${decision.reason}`);
     return null;
   }
-  const signature = await signApprovedRequirement(requirement, exported, url, decision);
-  return signature ? { signature, payment: decision } : null;
+  const signed = await signApprovedRequirement(requirement, exported, url, decision, onCapRefusal);
+  return signed ? { signature: signed.value, payment: decision, releaseCharge: signed.release } : null;
 }
 
 /**
- * Charge the session cap for an approved payment and run the synchronous
- * signer. Called right before signing, after every async check that could
- * still skip the option. The charge is released if the signer throws.
+ * Charge the session cap and run the local signer. Called right before
+ * signing, after every async check that could still skip the option.
  */
-function chargeAndSign(decision, sign) {
-  const charge = chargeSessionSpend(decision);
-  if (!charge.ok) {
-    console.error(`[x402] ${charge.reason}`);
+async function chargeAndSign(decision, onCapRefusal, sign) {
+  const signed = await signWithSessionCharge(decision, sign);
+  if (!signed.ok) {
+    console.error(`[x402] ${signed.reason}`);
+    onCapRefusal?.(signed.reason);
     return null;
   }
-  try {
-    return sign();
-  } catch (err) {
-    charge.release();
-    throw err;
-  }
+  return signed;
 }
 
 /**
  * Sign a requirement the policy guard already approved.
- * @returns {Promise<string|null>} Base64 payment signature, or null when skipped
+ * @returns {Promise<{ value: string, release: Function }|null>} Base64 payment
+ *   signature and its session-cap release, or null when skipped
  */
-async function signApprovedRequirement(requirement, exported, url, decision) {
+async function signApprovedRequirement(requirement, exported, url, decision, onCapRefusal) {
   // exportWallet returns a null key for a chain the wallet file doesn't hold.
   // Skip that option with a clear reason instead of failing on the missing key.
   const rail = isEvmNetwork(requirement.network) ? 'evm' : 'solana';
@@ -181,7 +178,7 @@ async function signApprovedRequirement(requirement, exported, url, decision) {
         return null;
       }
     }
-    return chargeAndSign(decision, () => createEvmPaymentPayload(
+    return chargeAndSign(decision, onCapRefusal, () => createEvmPaymentPayload(
       requirement,
       exported.evm.privateKey,
       exported.evm.address,
@@ -193,7 +190,7 @@ async function signApprovedRequirement(requirement, exported, url, decision) {
     if (!await hasSufficientSvmPaymentBalance(requirement, exported.solana.address)) return null;
     const rpcUrl = getSolanaRpcUrl(requirement.network);
     const blockhash = await fetchRecentBlockhash(rpcUrl);
-    return chargeAndSign(decision, () => createSvmPaymentPayload(
+    return chargeAndSign(decision, onCapRefusal, () => createSvmPaymentPayload(
       requirement,
       exported.solana.privateKey,
       exported.solana.address,
@@ -207,13 +204,16 @@ async function signApprovedRequirement(requirement, exported, url, decision) {
 
 /**
  * Generate payment signatures for all viable payment options, in priority order.
- * Yields { signature, network, asset, payment } objects, where payment is the
- * policy decision that approved the option. Caller should try each until one succeeds.
+ * Yields { signature, network, asset, payment, releaseCharge } objects, where
+ * payment is the policy decision that approved the option and releaseCharge
+ * returns its session-cap charge (call it when the server cleanly rejects the
+ * payment). Caller should try each until one succeeds.
  *
  * @param {Response} response - The 402 HTTP response
  * @param {string} url - The original request URL
- * @param {object} options - { password, walletName }
- * @returns {AsyncGenerator<{ signature: string, network: string, asset: string, payment: object }>}
+ * @param {object} options - { password, walletName, onCapRefusal }, where
+ *   onCapRefusal(reason) is called when the session cap refuses an option
+ * @returns {AsyncGenerator<{ signature: string, network: string, asset: string, payment: object, releaseCharge: Function }>}
  */
 export async function* createPaymentSignatures(response, url, options = {}) {
   const requirements = parsePaymentRequirements(response);
@@ -253,8 +253,10 @@ export async function* createPaymentSignatures(response, url, options = {}) {
 
   for (const req of ranked) {
     try {
-      const built = await buildPaymentForRequirement(req, exported, url);
-      if (built) yield { signature: built.signature, network: req.network, asset: req.asset, payment: built.payment };
+      const built = await buildPaymentForRequirement(req, exported, url, options.onCapRefusal);
+      if (built) {
+        yield { signature: built.signature, network: req.network, asset: req.asset, payment: built.payment, releaseCharge: built.releaseCharge };
+      }
     } catch (err) {
       // This payment option failed to build; say why and try the next one
       // (otherwise a malformed server option only surfaces as a generic
@@ -267,7 +269,9 @@ export async function* createPaymentSignatures(response, url, options = {}) {
 
 /**
  * Attempt to auto-pay a 402 response (single-shot, returns first viable signature).
- * For fallback support, use createPaymentSignatures() instead.
+ * For fallback support, use createPaymentSignatures() instead. The signature's
+ * session-cap charge is never released, so a payment the server rejects still
+ * counts against the cap.
  *
  * @param {Response} response - The 402 HTTP response
  * @param {string} url - The original request URL

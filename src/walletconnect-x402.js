@@ -9,7 +9,7 @@ import crypto from 'crypto';
 import { NansenError, ErrorCode } from './api.js';
 import { wcExec } from './walletconnect-exec.js';
 import { getWalletConnectAddress, parseWcJson } from './walletconnect-trading.js';
-import { chargeSessionSpend, evaluatePaymentRequirement, resolvePaymentAmount, resolvePayTo } from './x402-policy.js';
+import { evaluatePaymentRequirement, resolvePaymentAmount, resolvePayTo, signWithSessionCharge } from './x402-policy.js';
 import { isEvmNetwork } from './x402-evm.js';
 import { rankRequirements } from './x402.js';
 import { hasSufficientEvmPaymentBalance } from './x402-payment-balance.js';
@@ -270,10 +270,14 @@ async function signRequirement(requirement, fromAddress, typedData, resource) {
  * Throws when nothing can be signed (the last skip reason) or when signing
  * itself fails.
  *
+ * Yields the same { signature, network, asset, payment, releaseCharge } shape
+ * as createPaymentSignatures() in x402.js.
+ *
  * @param {Object} paymentRequirements - Decoded payment requirements from 402 response
- * @returns {AsyncGenerator<{ signature: string, network: string, asset: string, payment: object }>}
+ * @param {object} [options] - { onCapRefusal }, called with the reason when the session cap refuses an option
+ * @returns {AsyncGenerator<{ signature: string, network: string, asset: string, payment: object, releaseCharge: Function }>}
  */
-export async function* createWalletConnectPaymentSignatures(paymentRequirements) {
+export async function* createWalletConnectPaymentSignatures(paymentRequirements, options = {}) {
   const accepts = paymentRequirements.accepts || paymentRequirements;
   const list = Array.isArray(accepts) ? accepts : [accepts];
   const compatible = rankRequirements(list.filter(isCompatible))
@@ -297,22 +301,16 @@ export async function* createWalletConnectPaymentSignatures(paymentRequirements)
       lastError = error;
       continue;
     }
-    // Charge the session cap with no await before the approval prompt.
-    const charge = chargeSessionSpend(payment);
-    if (!charge.ok) {
-      if (compatible.length > 1) console.error(`[x402] Skipping ${requirement.network} WalletConnect option: ${charge.reason}`);
-      lastError = new Error(charge.reason);
+    // The charge comes before the approval prompt, so an over-cap option never prompts.
+    const signed = await signWithSessionCharge(payment, () => signRequirement(requirement, fromAddress, typedData, resource));
+    if (!signed.ok) {
+      console.error(`[x402] Skipping ${requirement.network} WalletConnect option: ${signed.reason}`);
+      options.onCapRefusal?.(signed.reason);
+      lastError = new Error(signed.reason);
       continue;
     }
-    let signature;
-    try {
-      signature = await signRequirement(requirement, fromAddress, typedData, resource);
-    } catch (err) {
-      charge.release();
-      throw err;
-    }
     yielded = true;
-    yield { signature, network: requirement.network, asset: requirement.asset, payment };
+    yield { signature: signed.value, network: requirement.network, asset: requirement.asset, payment, releaseCharge: signed.release };
   }
   if (!yielded && lastError) throw lastError;
 }
@@ -320,6 +318,8 @@ export async function* createWalletConnectPaymentSignatures(paymentRequirements)
 /**
  * Handle x402 payment: return the first viable Payment-Signature header.
  * For fallback across options, use createWalletConnectPaymentSignatures().
+ * The signature's session-cap charge is never released, so a payment the
+ * server rejects still counts against the cap.
  *
  * @param {Object} paymentRequirements - Decoded payment requirements from 402 response
  * @returns {string} Base64-encoded Payment-Signature header value

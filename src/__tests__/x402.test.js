@@ -488,6 +488,7 @@ describe('createPaymentSignatures — policy guard integration', () => {
       network: 'eip155:8453',
       asset: evm.asset,
       payment: expect.objectContaining({ ok: true, network: 'eip155:8453', asset: evm.asset, payTo: evm.payTo, amountRaw: '10000' }),
+      releaseCharge: expect.any(Function),
     }]);
     const skipIndex = consoleErrorSpy.mock.calls.findIndex(([line]) =>
       String(line).startsWith('[x402] Skipping solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp option: ')
@@ -556,6 +557,7 @@ describe('createPaymentSignatures — policy guard integration', () => {
       network: 'eip155:8453',
       asset: evm.asset,
       payment: expect.objectContaining({ ok: true, network: 'eip155:8453', asset: evm.asset, payTo: evm.payTo, amountRaw: '10000' }),
+      releaseCharge: expect.any(Function),
     }]);
     expect(createSvmSpy).not.toHaveBeenCalled();
     expect(consoleErrorSpy).toHaveBeenCalledWith(

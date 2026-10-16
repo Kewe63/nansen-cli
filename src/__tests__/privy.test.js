@@ -568,9 +568,9 @@ describe("createPrivyPaymentSignatures", () => {
       return { signingCalls };
     }
 
-    async function collect(requirements) {
+    async function collect(requirements, options) {
       const results = [];
-      for await (const r of createPrivyPaymentSignatures(make402Response(requirements), "https://api.nansen.ai/test")) results.push(r);
+      for await (const r of createPrivyPaymentSignatures(make402Response(requirements), "https://api.nansen.ai/test", options)) results.push(r);
       return results;
     }
 
@@ -579,10 +579,13 @@ describe("createPrivyPaymentSignatures", () => {
       const { signingCalls } = stubPrivy();
       const errors = vi.spyOn(console, "error").mockImplementation(() => {});
 
-      expect(await collect([evmRequirement])).toHaveLength(1);
-      expect(await collect([evmRequirement])).toHaveLength(0);
+      const onCapRefusal = vi.fn();
+      expect(await collect([evmRequirement], { onCapRefusal })).toHaveLength(1);
+      expect(onCapRefusal).not.toHaveBeenCalled();
+      expect(await collect([evmRequirement], { onCapRefusal })).toHaveLength(0);
 
       expect(signingCalls("eth_signTypedData_v4")).toBe(1);
+      expect(onCapRefusal).toHaveBeenCalledWith(expect.stringContaining("exceed the $0.05 session cap"));
       expect(errors).toHaveBeenCalledWith(expect.stringMatching(/^\[x402\] Refusing to auto-pay \$0\.05 USDC: .*NANSEN_X402_SESSION_MAX_AMOUNT/));
       errors.mockRestore();
     });

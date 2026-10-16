@@ -2,8 +2,8 @@
  * x402 payment policy guard.
  * Decides whether an auto-payment is safe to sign before any signature is produced.
  * Three layers: known-asset allowlist, optional payTo allowlist, per-payment USD cap.
- * An optional per-process cumulative cap (chargeSessionSpend) is charged by each
- * signer immediately before it signs.
+ * An optional per-process cumulative cap is charged by each signer, through
+ * signWithSessionCharge, immediately before it signs.
  */
 
 import { EVM_X402_TOKENS, SVM_X402_TOKENS } from './x402-tokens.js';
@@ -217,75 +217,109 @@ export function evaluatePaymentRequirement(requirement) {
     };
   }
 
-  return { ok: true, usd, symbol: known.symbol, network, asset, payTo, amountRaw: base.toString() };
+  return {
+    ok: true,
+    usd,
+    // A decimal string, not a BigInt, so the decision stays JSON-serializable.
+    amountMicroUsd: toMicroUsd(base, known.decimals).toString(),
+    symbol: known.symbol,
+    network,
+    asset,
+    payTo,
+    amountRaw: base.toString(),
+  };
 }
 
 // Cumulative USD auto-paid by this process, in integer micro-USD so repeated
 // charges can't drift past an exact cap the way float sums do (0.1 + 0.2).
+// It resets with every process: the cap bounds one invocation (its retries,
+// fallbacks and concurrent requests), not spending across separate runs.
 let sessionSpentMicroUsd = 0n;
+// The cap as first read, so it can't change partway through a run.
+let sessionCap;
 
 const MICRO_USD_PER_USD = 1_000_000n;
+const USD_AMOUNT = /^\d+(\.\d+)?$/;
 
+/**
+ * Token base units → micro-USD, rounded up so a fraction of a micro-dollar is
+ * never charged as zero.
+ */
+function toMicroUsd(base, decimals) {
+  const scale = 10n ** BigInt(decimals);
+  return (base * MICRO_USD_PER_USD + scale - 1n) / scale;
+}
+
+/** "$0.01", or up to six decimals ("$0.0015") when a sub-cent amount needs them. */
 function formatMicroUsd(micro) {
-  return `$${(Number(micro) / 1e6).toFixed(2)}`;
+  const fraction = (micro % MICRO_USD_PER_USD).toString().padStart(6, '0').replace(/0{1,4}$/, '');
+  return `$${micro / MICRO_USD_PER_USD}.${fraction}`;
 }
 
 /**
- * Resolve NANSEN_X402_SESSION_MAX_AMOUNT as a cap in micro-USD.
+ * Parse NANSEN_X402_SESSION_MAX_AMOUNT as a cap in micro-USD.
  * Returns null when the cap is disabled (unset, empty or "unlimited"), or
- * { error } for a value that isn't a non-negative number: a safety cap the
- * user asked for must not silently turn off because of a typo.
+ * { error } for a value that isn't a plain non-negative decimal: a safety cap
+ * the user asked for must not silently turn off because of a typo.
  */
 export function resolveSessionMaxMicroUsd() {
   const env = process.env.NANSEN_X402_SESSION_MAX_AMOUNT;
   if (env === undefined || env.trim() === '') return null;
-  if (env.trim().toLowerCase() === 'unlimited') return null;
-  const n = Number(env);
-  // A finite value such as 1e308 overflows to Infinity once scaled, which
-  // BigInt() would throw on, so check the scaled value too.
-  const micro = n * 1e6;
-  if (!Number.isFinite(n) || n < 0 || !Number.isFinite(micro)) {
+  const value = env.trim();
+  if (value.toLowerCase() === 'unlimited') return null;
+  // Plain decimals only: Number() would read "0x10" as $16 and "1e3" as $1000.
+  if (!USD_AMOUNT.test(value)) {
     return {
       error:
         `Refusing to auto-pay: NANSEN_X402_SESSION_MAX_AMOUNT="${env}" is not a valid USD amount. ` +
         'Set it to a number such as 5.00, or unset it to disable the session cap. No signature was produced.',
     };
   }
-  return BigInt(Math.round(micro));
+  const [whole, fraction = ''] = value.split('.');
+  // Digits past the sixth decimal are dropped, which can only lower the cap.
+  return BigInt(whole) * MICRO_USD_PER_USD + BigInt(fraction.slice(0, 6).padEnd(6, '0'));
+}
+
+function sessionMaxMicroUsd() {
+  if (sessionCap === undefined) sessionCap = resolveSessionMaxMicroUsd();
+  return sessionCap;
+}
+
+/**
+ * The refusal reason when NANSEN_X402_SESSION_MAX_AMOUNT is invalid, else
+ * null. Check it once before any payment work, so the error is reported once
+ * and before any balance or blockhash request.
+ */
+export function sessionCapConfigError() {
+  const cap = sessionMaxMicroUsd();
+  return cap !== null && typeof cap === 'object' ? cap.error : null;
 }
 
 /**
  * Charge an approved payment against the per-process cumulative cap.
- * Call it immediately before signing, with no await between this call and the
- * signature, so concurrent requests in one process can't both pass the check.
+ * Prefer signWithSessionCharge, which also runs the signer and releases the
+ * charge when signing fails.
  *
  * `decision` is the { ok: true } result of evaluatePaymentRequirement.
  * Returns { ok: true, release } and adds the amount to the session total, or
- * { ok: false, reason } and leaves the total unchanged. Call release() when
- * signing fails or produces no signature, so the attempt doesn't use up the
- * cap. Once a signature exists the charge stays, even if the server later
- * rejects the payment: the cap bounds what this process signed, which can
- * only over-count.
+ * { ok: false, reason } and leaves the total unchanged.
  */
 export function chargeSessionSpend(decision) {
-  const cap = resolveSessionMaxMicroUsd();
+  const cap = sessionMaxMicroUsd();
   if (cap === null) return { ok: true, release: () => {} };
   if (typeof cap === 'object') return { ok: false, reason: cap.error };
 
-  const known = resolveKnownToken(decision.network, decision.asset);
-  if (!known || decision.amountRaw === undefined) {
+  if (typeof decision.amountMicroUsd !== 'string' || !/^\d+$/.test(decision.amountMicroUsd)) {
     return { ok: false, reason: 'Refusing to auto-pay: payment amount is unknown, so the session cap cannot be applied. No signature was produced.' };
   }
-  // Round up so a fraction of a micro-dollar is never charged as zero.
-  const scale = 10n ** BigInt(known.decimals);
-  const micro = (BigInt(decision.amountRaw) * MICRO_USD_PER_USD + scale - 1n) / scale;
 
+  const micro = BigInt(decision.amountMicroUsd);
   const total = sessionSpentMicroUsd + micro;
   if (total > cap) {
     return {
       ok: false,
       reason:
-        `Refusing to auto-pay ${formatMicroUsd(micro)} ${known.symbol}: this process has already auto-paid ` +
+        `Refusing to auto-pay ${formatMicroUsd(micro)} ${decision.symbol}: this process has already auto-paid ` +
         `${formatMicroUsd(sessionSpentMicroUsd)}, and the payment would exceed the ${formatMicroUsd(cap)} ` +
         'session cap. To authorize, raise it with NANSEN_X402_SESSION_MAX_AMOUNT=<usd> (or unset it to disable). ' +
         'No signature was produced.',
@@ -301,6 +335,29 @@ export function chargeSessionSpend(decision) {
   return { ok: true, release };
 }
 
+/**
+ * Charge the session cap for an approved payment, then run `sign`. The signer
+ * starts in the same tick as the charge, so concurrent requests in one process
+ * can't both pass the check. Call it after every async check that could still
+ * skip the option.
+ *
+ * Returns { ok: false, reason } when the cap refuses, without calling `sign`,
+ * or { ok: true, value, release }. The charge is released if `sign` throws.
+ * The caller calls release() if the server cleanly rejects the payment; any
+ * other outcome keeps the charge, so the cap can only over-count.
+ */
+export async function signWithSessionCharge(decision, sign) {
+  const charge = chargeSessionSpend(decision);
+  if (!charge.ok) return charge;
+  try {
+    return { ok: true, value: await sign(), release: charge.release };
+  } catch (err) {
+    charge.release();
+    throw err;
+  }
+}
+
 export function resetSessionSpendForTests() {
   sessionSpentMicroUsd = 0n;
+  sessionCap = undefined;
 }

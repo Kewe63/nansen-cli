@@ -22,6 +22,8 @@ const {
   SUPPORTED_X402_SCHEMES,
   chargeSessionSpend,
   resolveSessionMaxMicroUsd,
+  sessionCapConfigError,
+  signWithSessionCharge,
   resetSessionSpendForTests,
 } = await import('../x402-policy.js');
 const { SOLANA_MAINNET_NETWORK } = await import('../x402-tokens.js');
@@ -519,9 +521,39 @@ describe('resolveSessionMaxMicroUsd', () => {
     expect(resolveSessionMaxMicroUsd()).toBe(290_000n);
   });
 
-  it.each(['garbage', '-1', 'NaN', 'Infinity', '1e308'])('returns an error instead of disabling the cap for %j', (value) => {
+  it('parses the decimal exactly and drops digits past the sixth', () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = ' 2.50 ';
+    expect(resolveSessionMaxMicroUsd()).toBe(2_500_000n);
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.0000019';
+    expect(resolveSessionMaxMicroUsd()).toBe(1n);
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '1' + '0'.repeat(400);
+    expect(resolveSessionMaxMicroUsd()).toBe(10n ** 406n);
+  });
+
+  it.each(['garbage', '-1', 'NaN', 'Infinity', '1e308', '1e3', '0x10', '.5', '5.', '1_000'])('returns an error instead of disabling the cap for %j', (value) => {
     process.env.NANSEN_X402_SESSION_MAX_AMOUNT = value;
     expect(resolveSessionMaxMicroUsd().error).toMatch(/NANSEN_X402_SESSION_MAX_AMOUNT=.* is not a valid USD amount/);
+  });
+});
+
+describe('sessionCapConfigError', () => {
+  beforeEach(() => resetSessionSpendForTests());
+  afterEach(() => {
+    delete process.env.NANSEN_X402_SESSION_MAX_AMOUNT;
+    resetSessionSpendForTests();
+  });
+
+  it.each([undefined, 'unlimited', '0', '5.00'])('is null for %j', (value) => {
+    if (value !== undefined) process.env.NANSEN_X402_SESSION_MAX_AMOUNT = value;
+    expect(sessionCapConfigError()).toBeNull();
+  });
+
+  it('returns the refusal reason for an invalid value', () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '1e3';
+    expect(sessionCapConfigError()).toBe(
+      'Refusing to auto-pay: NANSEN_X402_SESSION_MAX_AMOUNT="1e3" is not a valid USD amount. ' +
+      'Set it to a number such as 5.00, or unset it to disable the session cap. No signature was produced.',
+    );
   });
 });
 
@@ -584,6 +616,32 @@ describe('chargeSessionSpend', () => {
     expect(chargeSessionSpend(approve('10000')).ok).toBe(false);
   });
 
+  it('reads the cap once, so changing the variable mid-run has no effect', () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.01';
+    expect(chargeSessionSpend(approve('10000')).ok).toBe(true);
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '100';
+    expect(chargeSessionSpend(approve('10000')).ok).toBe(false);
+  });
+
+  it('shows sub-cent amounts with up to six decimals', () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.003';
+    expect(chargeSessionSpend(approve('1500')).ok).toBe(true);
+    expect(chargeSessionSpend(approve('1500')).ok).toBe(true);
+    const refused = chargeSessionSpend(approve('1'));
+    expect(refused.reason).toContain(
+      'Refusing to auto-pay $0.000001 USDC: this process has already auto-paid $0.003, and the payment would exceed the $0.003 session cap.',
+    );
+  });
+
+  it('charges the amount the policy decision carries, so both caps price a payment the same way', () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.02';
+    const decision = approve('10000');
+    expect(decision.amountMicroUsd).toBe('10000');
+    expect(() => JSON.stringify(decision)).not.toThrow();
+    expect(chargeSessionSpend({ ...decision, amountMicroUsd: '30000' }).ok).toBe(false);
+    expect(chargeSessionSpend({ ...decision, amountMicroUsd: undefined }).reason).toContain('payment amount is unknown');
+  });
+
   it('rounds a sub-micro-dollar 18-decimal amount up rather than charging zero', () => {
     process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0';
     const bsc = { scheme: 'exact', network: 'eip155:56', asset: '0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d', payTo: '0xRecipient' };
@@ -595,5 +653,51 @@ describe('chargeSessionSpend', () => {
     const refused = chargeSessionSpend(approve('10000'));
     expect(refused.ok).toBe(false);
     expect(refused.reason).toContain('NANSEN_X402_SESSION_MAX_AMOUNT="5usd" is not a valid USD amount');
+  });
+});
+
+describe('signWithSessionCharge', () => {
+  const decision = () => evaluatePaymentRequirement({ ...BASE_USDC_REQUIREMENT, amount: '10000' });
+
+  beforeEach(() => {
+    resetSessionSpendForTests();
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.01';
+  });
+  afterEach(() => {
+    delete process.env.NANSEN_X402_SESSION_MAX_AMOUNT;
+    resetSessionSpendForTests();
+  });
+
+  it('returns the signature with a release that frees the charge', async () => {
+    const signed = await signWithSessionCharge(decision(), async () => 'sig');
+    expect(signed).toEqual({ ok: true, value: 'sig', release: expect.any(Function) });
+    expect(chargeSessionSpend(decision()).ok).toBe(false);
+
+    signed.release();
+    expect(chargeSessionSpend(decision()).ok).toBe(true);
+  });
+
+  it('refuses without calling the signer when the cap is reached', async () => {
+    expect(chargeSessionSpend(decision()).ok).toBe(true);
+    const sign = vi.fn();
+    const signed = await signWithSessionCharge(decision(), sign);
+    expect(signed.ok).toBe(false);
+    expect(signed.reason).toContain('exceed the $0.01 session cap');
+    expect(sign).not.toHaveBeenCalled();
+  });
+
+  it('releases the charge and rethrows when the signer fails', async () => {
+    await expect(signWithSessionCharge(decision(), async () => { throw new Error('rejected by wallet'); }))
+      .rejects.toThrow('rejected by wallet');
+    expect(chargeSessionSpend(decision()).ok).toBe(true);
+  });
+
+  it('charges before the signer starts, so a concurrent request sees the charge', async () => {
+    let finish;
+    const first = signWithSessionCharge(decision(), () => new Promise((resolve) => { finish = resolve; }));
+    const second = await signWithSessionCharge(decision(), async () => 'sig');
+    expect(second.ok).toBe(false);
+    finish('sig');
+    expect((await first).ok).toBe(true);
   });
 });
