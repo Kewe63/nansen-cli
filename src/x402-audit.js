@@ -6,12 +6,15 @@
  * payment signature, request or response bodies, or the URL's query string.
  *
  * Writes are best-effort: a failure warns once on stderr and never blocks a
- * payment. The log is for auditing; it is not a safety control.
+ * payment. The log is for auditing; it is not a safety control. A symlinked or
+ * hard-linked log, or a symlinked x402 directory, is refused rather than
+ * followed, so records never land in (or re-permission) another file.
  */
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { openLocalFile } from './local-file.js';
 
 let warned = false;
 
@@ -38,19 +41,37 @@ export function sanitizeRequestUrl(url) {
 }
 
 /**
+ * Tighten the x402 directory to 0700 through a descriptor opened without
+ * following symlinks, so a swapped-in link can't redirect the chmod.
+ */
+function tightenDirectory(dir) {
+  if (process.platform === 'win32') return;
+  const { O_RDONLY, O_DIRECTORY, O_NOFOLLOW } = fs.constants;
+  const fd = fs.openSync(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+  try {
+    fs.fchmodSync(fd, 0o700);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
  * Append one record. Never throws.
  */
 export function appendPaymentRecord(record) {
   const file = x402AuditLogPath();
+  const dir = path.dirname(file);
   let fd;
   try {
-    const dir = path.dirname(file);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    fs.chmodSync(dir, 0o700);
-    fd = fs.openSync(file, 'a', 0o600);
+    const { O_WRONLY, O_APPEND, O_CREAT } = fs.constants;
+    // Refuses a symlink or hard link at the log or the x402 directory, and a
+    // path swapped while opening.
+    fd = openLocalFile(file, { root: path.dirname(dir), flags: O_WRONLY | O_APPEND | O_CREAT, mode: 0o600 });
     // The open mode only applies when the file is created; tighten an
     // existing file too.
     fs.fchmodSync(fd, 0o600);
+    tightenDirectory(dir);
     fs.writeSync(fd, `${JSON.stringify({ timestamp: new Date().toISOString(), ...record })}\n`);
   } catch (err) {
     if (!warned) {

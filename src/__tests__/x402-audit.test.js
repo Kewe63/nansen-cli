@@ -80,6 +80,48 @@ describe('x402 payment audit log', () => {
     );
   });
 
+  it.runIf(posix)('refuses a symlinked log and leaves the link target untouched', () => {
+    const target = path.join(home, 'elsewhere.txt');
+    fs.writeFileSync(target, 'keep me\n', { mode: 0o644 });
+    fs.mkdirSync(path.dirname(x402AuditLogPath()), { recursive: true, mode: 0o700 });
+    fs.symlinkSync(target, x402AuditLogPath());
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() => appendPaymentRecord({ id: 'a', event: 'signed' })).not.toThrow();
+
+    expect(fs.readFileSync(target, 'utf8')).toBe('keep me\n');
+    expect(mode(target)).toBe(0o644);
+    expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/could not write the payment audit log .*symlinks/));
+  });
+
+  it.runIf(posix)('refuses a symlinked x402 directory and leaves the link target untouched', () => {
+    const target = fs.mkdtempSync(path.join(home, 'elsewhere-'));
+    fs.chmodSync(target, 0o755);
+    fs.mkdirSync(path.join(home, '.nansen'), { mode: 0o700 });
+    fs.symlinkSync(target, path.join(home, '.nansen', 'x402'));
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() => appendPaymentRecord({ id: 'a', event: 'signed' })).not.toThrow();
+
+    expect(fs.readdirSync(target)).toEqual([]);
+    expect(mode(target)).toBe(0o755);
+    expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/could not write the payment audit log .*symlinks/));
+  });
+
+  it.runIf(posix)('refuses a hard-linked log and leaves the other name untouched', () => {
+    const other = path.join(home, 'other.txt');
+    fs.writeFileSync(other, 'keep me\n', { mode: 0o644 });
+    fs.mkdirSync(path.dirname(x402AuditLogPath()), { recursive: true, mode: 0o700 });
+    fs.linkSync(other, x402AuditLogPath());
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() => appendPaymentRecord({ id: 'a', event: 'signed' })).not.toThrow();
+
+    expect(fs.readFileSync(other, 'utf8')).toBe('keep me\n');
+    expect(mode(other)).toBe(0o644);
+    expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/could not write the payment audit log .*hard links/));
+  });
+
   it('generates a distinct id per payment', () => {
     expect(newPaymentId()).not.toBe(newPaymentId());
   });
