@@ -12,7 +12,7 @@ import { parsePaymentRequirements } from "./x402.js";
 import { hasSufficientEvmPaymentBalance, hasSufficientSvmPaymentBalance } from "./x402-payment-balance.js";
 import { isEvmNetwork } from "./x402-evm.js";
 import { mkdirPrivateSync, readWalletJson, writeWalletJsonAtomic } from "./wallet.js";
-import { evaluatePaymentRequirement, resolvePaymentAmount, resolvePayTo } from "./x402-policy.js";
+import { chargeSessionSpend, evaluatePaymentRequirement, resolvePaymentAmount, resolvePayTo } from "./x402-policy.js";
 import {
   isSvmNetwork,
   getSolanaRpcUrl,
@@ -311,6 +311,12 @@ export async function* createPrivyPaymentSignatures(response, url) {
             requirement,
           });
 
+          // Charge the session cap with no await before the signing request.
+          const charge = chargeSessionSpend(decision);
+          if (!charge.ok) {
+            console.error(`[x402] ${charge.reason}`);
+            continue;
+          }
           const signResult = await client.ethSignTypedDataV4(
             evmWallet.id,
             typedData
@@ -366,6 +372,11 @@ export async function* createPrivyPaymentSignatures(response, url) {
             recentBlockhash,
           );
 
+          const charge = chargeSessionSpend(svmDecision);
+          if (!charge.ok) {
+            console.error(`[x402] ${charge.reason}`);
+            continue;
+          }
           const signResult = await client.signSolanaTransaction(solWallet.id, txBase64);
           const signedTx = signResult.data?.signed_transaction || signResult.signed_transaction;
 

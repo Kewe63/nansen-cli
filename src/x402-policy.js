@@ -2,6 +2,8 @@
  * x402 payment policy guard.
  * Decides whether an auto-payment is safe to sign before any signature is produced.
  * Three layers: known-asset allowlist, optional payTo allowlist, per-payment USD cap.
+ * An optional per-process cumulative cap (chargeSessionSpend) is charged by each
+ * signer immediately before it signs.
  */
 
 import { EVM_X402_TOKENS, SVM_X402_TOKENS } from './x402-tokens.js';
@@ -216,4 +218,78 @@ export function evaluatePaymentRequirement(requirement) {
   }
 
   return { ok: true, usd, symbol: known.symbol, network, asset, payTo, amountRaw: base.toString() };
+}
+
+// Cumulative USD auto-paid by this process, in integer micro-USD so repeated
+// charges can't drift past an exact cap the way float sums do (0.1 + 0.2).
+let sessionSpentMicroUsd = 0n;
+
+const MICRO_USD_PER_USD = 1_000_000n;
+
+function formatMicroUsd(micro) {
+  return `$${(Number(micro) / 1e6).toFixed(2)}`;
+}
+
+/**
+ * Resolve NANSEN_X402_SESSION_MAX_AMOUNT as a cap in micro-USD.
+ * Returns null when the cap is disabled (unset, empty or "unlimited"), or
+ * { error } for a value that isn't a non-negative number: a safety cap the
+ * user asked for must not silently turn off because of a typo.
+ */
+export function resolveSessionMaxMicroUsd() {
+  const env = process.env.NANSEN_X402_SESSION_MAX_AMOUNT;
+  if (env === undefined || env.trim() === '') return null;
+  if (env.trim().toLowerCase() === 'unlimited') return null;
+  const n = Number(env);
+  if (!Number.isFinite(n) || n < 0) {
+    return {
+      error:
+        `Refusing to auto-pay: NANSEN_X402_SESSION_MAX_AMOUNT="${env}" is not a valid USD amount. ` +
+        'Set it to a number such as 5.00, or unset it to disable the session cap. No signature was produced.',
+    };
+  }
+  return BigInt(Math.round(n * 1e6));
+}
+
+/**
+ * Charge an approved payment against the per-process cumulative cap.
+ * Call it immediately before signing, with no await between this call and the
+ * signature, so concurrent requests in one process can't both pass the check.
+ *
+ * `decision` is the { ok: true } result of evaluatePaymentRequirement.
+ * Returns { ok: true } and adds the amount to the session total, or
+ * { ok: false, reason } and leaves the total unchanged. A charged amount is
+ * never refunded, even if the server later rejects the payment: the cap
+ * bounds what this process signed, which can only over-count.
+ */
+export function chargeSessionSpend(decision) {
+  const cap = resolveSessionMaxMicroUsd();
+  if (cap === null) return { ok: true };
+  if (typeof cap === 'object') return { ok: false, reason: cap.error };
+
+  const known = resolveKnownToken(decision.network, decision.asset);
+  if (!known || decision.amountRaw === undefined) {
+    return { ok: false, reason: 'Refusing to auto-pay: payment amount is unknown, so the session cap cannot be applied. No signature was produced.' };
+  }
+  // Round up so a fraction of a micro-dollar is never charged as zero.
+  const scale = 10n ** BigInt(known.decimals);
+  const micro = (BigInt(decision.amountRaw) * MICRO_USD_PER_USD + scale - 1n) / scale;
+
+  const total = sessionSpentMicroUsd + micro;
+  if (total > cap) {
+    return {
+      ok: false,
+      reason:
+        `Refusing to auto-pay ${formatMicroUsd(micro)} ${known.symbol}: this process has already auto-paid ` +
+        `${formatMicroUsd(sessionSpentMicroUsd)}, and the payment would exceed the ${formatMicroUsd(cap)} ` +
+        'session cap. To authorize, raise it with NANSEN_X402_SESSION_MAX_AMOUNT=<usd> (or unset it to disable). ' +
+        'No signature was produced.',
+    };
+  }
+  sessionSpentMicroUsd = total;
+  return { ok: true };
+}
+
+export function resetSessionSpendForTests() {
+  sessionSpentMicroUsd = 0n;
 }

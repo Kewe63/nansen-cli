@@ -7,6 +7,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { PrivyClient, createPrivyPaymentSignatures } from "../privy.js";
+import { resetSessionSpendForTests } from "../x402-policy.js";
 
 // Prevent evaluatePaymentRequirement → resolveMaxAmountUsd → getWalletConfig
 // from reading the real ~/.nansen/wallets/config.json. Without this mock the
@@ -205,12 +206,14 @@ describe("createPrivyPaymentSignatures", () => {
     process.env.HOME = tempDir;
     process.env.PRIVY_APP_ID = "test-app-id";
     process.env.PRIVY_APP_SECRET = "test-app-secret";
+    resetSessionSpendForTests();
   });
 
   afterEach(() => {
     process.env = originalEnv;
     vi.unstubAllGlobals();
     fs.rmSync(tempDir, { recursive: true, force: true });
+    resetSessionSpendForTests();
   });
 
   function make402Response(requirements) {
@@ -524,6 +527,74 @@ describe("createPrivyPaymentSignatures", () => {
     if (expected) expect(results[0].asset).toBe(mint);
     const signingCalls = fetchMock.mock.calls.filter(([, options]) => typeof options?.body === "string" && JSON.parse(options.body).method === "signTransaction");
     expect(signingCalls).toHaveLength(expected);
+  });
+
+  describe("session spend cap", () => {
+    const solRequirement = {
+      scheme: "exact",
+      network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+      asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      payTo: "7UX2i7SucgLMQcfZ75s3VXmZZY4YRUyJN9X1RgfMoDUi",
+      amount: "50000",
+      extra: { feePayer: "11111111111111111111111111111111" },
+    };
+
+    function stubPrivy() {
+      const fetchMock = vi.fn(async (url, options) => {
+        const body = typeof options?.body === "string" ? options.body : "";
+        if (body.includes('"eth_call"')) return { ok: true, json: async () => ({ result: "0xc350" }) };
+        if (body.includes('"getLatestBlockhash"')) {
+          return { ok: true, json: async () => ({ result: { value: { blockhash: "GHtXQBpokCUCJwhRAJbhGVPKp9VTVn65CWVRqFMJkFwh" } } }) };
+        }
+        if (typeof url === "string" && url.includes("/wallets") && !url.includes("/rpc")) {
+          return {
+            ok: true,
+            json: async () => ({
+              data: [
+                { id: "w-1", address: "0x1234567890abcdef1234567890abcdef12345678", chain_type: "ethereum" },
+                { id: "wl_sol_1", address: solRequirement.payTo, chain_type: "solana" },
+              ],
+            }),
+          };
+        }
+        return { ok: true, json: async () => ({ data: { signature: "0xfakesignature", signed_transaction: "c2lnbmVkdHhiYXNlNjQ=" } }) };
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const signingCalls = (method) => fetchMock.mock.calls.filter(([, options]) =>
+        typeof options?.body === "string" && JSON.parse(options.body).method === method).length;
+      return { signingCalls };
+    }
+
+    async function collect(requirements) {
+      const results = [];
+      for await (const r of createPrivyPaymentSignatures(make402Response(requirements), "https://api.nansen.ai/test")) results.push(r);
+      return results;
+    }
+
+    it("stops signing EVM payments once the process reaches the cap", async () => {
+      process.env.NANSEN_X402_SESSION_MAX_AMOUNT = "0.05";
+      const { signingCalls } = stubPrivy();
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      expect(await collect([evmRequirement])).toHaveLength(1);
+      expect(await collect([evmRequirement])).toHaveLength(0);
+
+      expect(signingCalls("eth_signTypedData_v4")).toBe(1);
+      expect(errors).toHaveBeenCalledWith(expect.stringMatching(/^\[x402\] Refusing to auto-pay \$0\.05 USDC: .*NANSEN_X402_SESSION_MAX_AMOUNT/));
+      errors.mockRestore();
+    });
+
+    it("refuses a Solana payment over the cap without asking Privy to sign", async () => {
+      process.env.NANSEN_X402_SESSION_MAX_AMOUNT = "0.04";
+      const { signingCalls } = stubPrivy();
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      expect(await collect([solRequirement])).toHaveLength(0);
+
+      expect(signingCalls("signTransaction")).toBe(0);
+      expect(errors).toHaveBeenCalledWith(expect.stringContaining("exceed the $0.04 session cap"));
+      errors.mockRestore();
+    });
   });
 });
 

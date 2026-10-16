@@ -1253,6 +1253,9 @@ ENVIRONMENT:
   NANSEN_BASE_RPC           Custom Base RPC endpoint
   NANSEN_SOLANA_RPC         Custom Solana RPC endpoint
   NANSEN_X402_MAX_AMOUNT    Max USD per x402 auto-payment (default 1.00; "unlimited" to disable)
+  NANSEN_X402_SESSION_MAX_AMOUNT
+                            Max total USD of x402 auto-payments signed by one CLI process
+                            (unset = no limit). Signed payments count even if the server rejects them.
   NANSEN_X402_ALLOWED_PAYTO Comma-separated recipient allowlist for x402 auto-payment (optional)
 
 x402 auto-payments are recorded in ~/.nansen/x402/payments.jsonl (amount, network,

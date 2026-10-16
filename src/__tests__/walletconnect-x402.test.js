@@ -6,6 +6,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('../x402-policy.js', () => ({
   evaluatePaymentRequirement: vi.fn(),
+  chargeSessionSpend: vi.fn(),
   resolvePaymentAmount: (requirement) =>
     requirement.amount !== undefined && requirement.amount !== null && requirement.amount !== ''
       ? requirement.amount
@@ -24,7 +25,7 @@ vi.mock('../x402-payment-balance.js', () => ({
   hasSufficientEvmPaymentBalance: vi.fn(),
 }));
 
-import { evaluatePaymentRequirement } from '../x402-policy.js';
+import { chargeSessionSpend, evaluatePaymentRequirement } from '../x402-policy.js';
 import { wcExec } from '../walletconnect-exec.js';
 import { hasSufficientEvmPaymentBalance } from '../x402-payment-balance.js';
 import {
@@ -57,6 +58,7 @@ const PAYMENT_REQUIREMENTS = { accepts: [REQUIREMENT] };
 
 beforeEach(() => {
   vi.clearAllMocks();
+  chargeSessionSpend.mockReturnValue({ ok: true });
   hasSufficientEvmPaymentBalance.mockResolvedValue(true);
   // Default: wallet connected, wcExec returns whoami then sign result
   wcExec.mockImplementation((_cmd, args) => {
@@ -330,6 +332,25 @@ describe('createWalletConnectPaymentSignatures — option fallback', () => {
 
     expect(items.map(i => i.asset)).toEqual([USD1]);
     expect(errorLog).toHaveBeenCalledWith(expect.stringMatching(/extra\.chainId 1 conflicts/));
+  });
+
+  it('refuses an option over the session cap without prompting', async () => {
+    const reason = 'Refusing to auto-pay $0.01 USD: ... session cap.';
+    chargeSessionSpend.mockReturnValue({ ok: false, reason });
+
+    await expect(collect([bsc(U)])).rejects.toThrow(reason);
+    expect(signCalls()).toHaveLength(0);
+  });
+
+  it('charges the session cap only for an option that reaches the prompt', async () => {
+    hasSufficientEvmPaymentBalance.mockImplementation(async req => req.asset !== U);
+    const decision = { ok: true, usd: 0.01, symbol: 'USD1', network: 'eip155:56', asset: USD1, payTo: '0xRecipient', amountRaw: '10000000000000000' };
+    evaluatePaymentRequirement.mockReturnValue(decision);
+
+    await collect([bsc(U), bsc(USD1)]);
+
+    expect(chargeSessionSpend).toHaveBeenCalledTimes(1);
+    expect(chargeSessionSpend).toHaveBeenCalledWith(decision);
   });
 
   it('does not prompt again after the user rejects a signature', async () => {

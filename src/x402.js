@@ -14,7 +14,7 @@ import {
 import { resolvePassword } from './keychain.js';
 import { EVM_X402_RPCS, hasSufficientEvmPaymentBalance, hasSufficientSvmPaymentBalance } from './x402-payment-balance.js';
 export { EVM_X402_RPCS } from './x402-payment-balance.js';
-import { evaluatePaymentRequirement, resolvePaymentAmount } from './x402-policy.js';
+import { chargeSessionSpend, evaluatePaymentRequirement, resolvePaymentAmount } from './x402-policy.js';
 import { EVM_X402_TOKENS } from './x402-tokens.js';
 export { EVM_X402_TOKENS } from './x402-tokens.js';
 
@@ -121,15 +121,25 @@ async function buildPaymentForRequirement(requirement, exported, url) {
     console.error(`[x402] ${decision.reason}`);
     return null;
   }
-  const signature = await signApprovedRequirement(requirement, exported, url);
+  const signature = await signApprovedRequirement(requirement, exported, url, decision);
   return signature ? { signature, payment: decision } : null;
+}
+
+/**
+ * Charge the session cap for an approved payment. Called synchronously right
+ * before signing, after every async check that could still skip the option.
+ */
+function chargeOrSkip(decision) {
+  const charge = chargeSessionSpend(decision);
+  if (!charge.ok) console.error(`[x402] ${charge.reason}`);
+  return charge.ok;
 }
 
 /**
  * Sign a requirement the policy guard already approved.
  * @returns {Promise<string|null>} Base64 payment signature, or null when skipped
  */
-async function signApprovedRequirement(requirement, exported, url) {
+async function signApprovedRequirement(requirement, exported, url, decision) {
   // exportWallet returns a null key for a chain the wallet file doesn't hold.
   // Skip that option with a clear reason instead of failing on the missing key.
   const rail = isEvmNetwork(requirement.network) ? 'evm' : 'solana';
@@ -162,6 +172,7 @@ async function signApprovedRequirement(requirement, exported, url) {
         return null;
       }
     }
+    if (!chargeOrSkip(decision)) return null;
     return createEvmPaymentPayload(
       requirement,
       exported.evm.privateKey,
@@ -174,6 +185,7 @@ async function signApprovedRequirement(requirement, exported, url) {
     if (!await hasSufficientSvmPaymentBalance(requirement, exported.solana.address)) return null;
     const rpcUrl = getSolanaRpcUrl(requirement.network);
     const blockhash = await fetchRecentBlockhash(rpcUrl);
+    if (!chargeOrSkip(decision)) return null;
     return createSvmPaymentPayload(
       requirement,
       exported.solana.privateKey,

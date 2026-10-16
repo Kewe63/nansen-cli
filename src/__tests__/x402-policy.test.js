@@ -3,7 +3,7 @@
  * Covers the known-asset allowlist, per-payment USD cap, and payTo allowlist.
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mock wallet.js so getWalletConfig doesn't touch the filesystem.
 vi.mock('../wallet.js', () => ({
@@ -20,6 +20,9 @@ const {
   isPayToAllowed,
   DEFAULT_X402_MAX_AMOUNT_USD,
   SUPPORTED_X402_SCHEMES,
+  chargeSessionSpend,
+  resolveSessionMaxMicroUsd,
+  resetSessionSpendForTests,
 } = await import('../x402-policy.js');
 const { SOLANA_MAINNET_NETWORK } = await import('../x402-tokens.js');
 
@@ -498,5 +501,86 @@ describe('isPayToAllowed', () => {
     process.env.NANSEN_X402_ALLOWED_PAYTO = real;
     expect(isPayToAllowed(real, 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp')).toBe(true);
     expect(isPayToAllowed(caseFlipped, 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp')).toBe(false);
+  });
+});
+
+describe('resolveSessionMaxMicroUsd', () => {
+  afterEach(() => {
+    delete process.env.NANSEN_X402_SESSION_MAX_AMOUNT;
+  });
+
+  it.each([undefined, '', '   ', 'unlimited', 'UNLIMITED'])('disables the cap for %j', (value) => {
+    if (value !== undefined) process.env.NANSEN_X402_SESSION_MAX_AMOUNT = value;
+    expect(resolveSessionMaxMicroUsd()).toBeNull();
+  });
+
+  it('converts a USD amount to micro-USD without float error', () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.29'; // 0.29 * 1e6 is 289999.99999999994
+    expect(resolveSessionMaxMicroUsd()).toBe(290_000n);
+  });
+
+  it.each(['garbage', '-1', 'NaN', 'Infinity'])('returns an error instead of disabling the cap for %j', (value) => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = value;
+    expect(resolveSessionMaxMicroUsd().error).toMatch(/NANSEN_X402_SESSION_MAX_AMOUNT=.* is not a valid USD amount/);
+  });
+});
+
+describe('chargeSessionSpend', () => {
+  const approve = (amount, requirement = BASE_USDC_REQUIREMENT) => {
+    const decision = evaluatePaymentRequirement({ ...requirement, amount });
+    expect(decision.ok).toBe(true);
+    return decision;
+  };
+
+  beforeEach(() => resetSessionSpendForTests());
+  afterEach(() => {
+    delete process.env.NANSEN_X402_SESSION_MAX_AMOUNT;
+    resetSessionSpendForTests();
+  });
+
+  it('always passes when the cap is unset', () => {
+    for (let i = 0; i < 1000; i++) expect(chargeSessionSpend(approve('1000000'))).toEqual({ ok: true });
+  });
+
+  it('allows payments up to and including the cap, then refuses', () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.03';
+    expect(chargeSessionSpend(approve('10000')).ok).toBe(true);
+    expect(chargeSessionSpend(approve('10000')).ok).toBe(true);
+    expect(chargeSessionSpend(approve('10000')).ok).toBe(true); // exactly $0.03
+
+    const refused = chargeSessionSpend(approve('10000'));
+    expect(refused.ok).toBe(false);
+    expect(refused.reason).toBe(
+      'Refusing to auto-pay $0.01 USDC: this process has already auto-paid $0.03, and the payment would exceed ' +
+      'the $0.03 session cap. To authorize, raise it with NANSEN_X402_SESSION_MAX_AMOUNT=<usd> (or unset it to disable). ' +
+      'No signature was produced.',
+    );
+  });
+
+  it('does not drift past an exact cap the way float sums do', () => {
+    // 0.1 + 0.2 > 0.3 in floating point.
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.3';
+    expect(chargeSessionSpend(approve('100000')).ok).toBe(true);
+    expect(chargeSessionSpend(approve('200000')).ok).toBe(true);
+  });
+
+  it('does not add a refused payment to the total', () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.05';
+    expect(chargeSessionSpend(approve('40000')).ok).toBe(true);
+    expect(chargeSessionSpend(approve('20000')).ok).toBe(false);
+    expect(chargeSessionSpend(approve('10000')).ok).toBe(true); // 0.04 + 0.01, not 0.04 + 0.02 + 0.01
+  });
+
+  it('rounds a sub-micro-dollar 18-decimal amount up rather than charging zero', () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0';
+    const bsc = { scheme: 'exact', network: 'eip155:56', asset: '0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d', payTo: '0xRecipient' };
+    expect(chargeSessionSpend(approve('1', bsc)).ok).toBe(false);
+  });
+
+  it('refuses every payment while the cap value is invalid', () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '5usd';
+    const refused = chargeSessionSpend(approve('10000'));
+    expect(refused.ok).toBe(false);
+    expect(refused.reason).toContain('NANSEN_X402_SESSION_MAX_AMOUNT="5usd" is not a valid USD amount');
   });
 });

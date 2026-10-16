@@ -9,7 +9,7 @@ import crypto from 'crypto';
 import { NansenError, ErrorCode } from './api.js';
 import { wcExec } from './walletconnect-exec.js';
 import { getWalletConnectAddress, parseWcJson } from './walletconnect-trading.js';
-import { evaluatePaymentRequirement, resolvePaymentAmount, resolvePayTo } from './x402-policy.js';
+import { chargeSessionSpend, evaluatePaymentRequirement, resolvePaymentAmount, resolvePayTo } from './x402-policy.js';
 import { isEvmNetwork } from './x402-evm.js';
 import { rankRequirements } from './x402.js';
 import { hasSufficientEvmPaymentBalance } from './x402-payment-balance.js';
@@ -295,6 +295,13 @@ export async function* createWalletConnectPaymentSignatures(paymentRequirements)
     if (error) {
       if (compatible.length > 1 && !logged) console.error(`[x402] Skipping ${requirement.network} WalletConnect option: ${error.message}`);
       lastError = error;
+      continue;
+    }
+    // Charge the session cap with no await before the approval prompt.
+    const charge = chargeSessionSpend(payment);
+    if (!charge.ok) {
+      if (compatible.length > 1) console.error(`[x402] Skipping ${requirement.network} WalletConnect option: ${charge.reason}`);
+      lastError = new Error(charge.reason);
       continue;
     }
     const signature = await signRequirement(requirement, fromAddress, typedData, resource);
