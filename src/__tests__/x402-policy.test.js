@@ -519,7 +519,7 @@ describe('resolveSessionMaxMicroUsd', () => {
     expect(resolveSessionMaxMicroUsd()).toBe(290_000n);
   });
 
-  it.each(['garbage', '-1', 'NaN', 'Infinity'])('returns an error instead of disabling the cap for %j', (value) => {
+  it.each(['garbage', '-1', 'NaN', 'Infinity', '1e308'])('returns an error instead of disabling the cap for %j', (value) => {
     process.env.NANSEN_X402_SESSION_MAX_AMOUNT = value;
     expect(resolveSessionMaxMicroUsd().error).toMatch(/NANSEN_X402_SESSION_MAX_AMOUNT=.* is not a valid USD amount/);
   });

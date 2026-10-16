@@ -241,14 +241,17 @@ export function resolveSessionMaxMicroUsd() {
   if (env === undefined || env.trim() === '') return null;
   if (env.trim().toLowerCase() === 'unlimited') return null;
   const n = Number(env);
-  if (!Number.isFinite(n) || n < 0) {
+  // A finite value such as 1e308 overflows to Infinity once scaled, which
+  // BigInt() would throw on, so check the scaled value too.
+  const micro = n * 1e6;
+  if (!Number.isFinite(n) || n < 0 || !Number.isFinite(micro)) {
     return {
       error:
         `Refusing to auto-pay: NANSEN_X402_SESSION_MAX_AMOUNT="${env}" is not a valid USD amount. ` +
         'Set it to a number such as 5.00, or unset it to disable the session cap. No signature was produced.',
     };
   }
-  return BigInt(Math.round(n * 1e6));
+  return BigInt(Math.round(micro));
 }
 
 /**
