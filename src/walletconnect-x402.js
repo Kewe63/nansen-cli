@@ -304,7 +304,13 @@ export async function* createWalletConnectPaymentSignatures(paymentRequirements)
       lastError = new Error(charge.reason);
       continue;
     }
-    const signature = await signRequirement(requirement, fromAddress, typedData, resource);
+    let signature;
+    try {
+      signature = await signRequirement(requirement, fromAddress, typedData, resource);
+    } catch (err) {
+      charge.release();
+      throw err;
+    }
     yielded = true;
     yield { signature, network: requirement.network, asset: requirement.asset, payment };
   }

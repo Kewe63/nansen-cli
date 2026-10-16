@@ -58,7 +58,7 @@ const PAYMENT_REQUIREMENTS = { accepts: [REQUIREMENT] };
 
 beforeEach(() => {
   vi.clearAllMocks();
-  chargeSessionSpend.mockReturnValue({ ok: true });
+  chargeSessionSpend.mockReturnValue({ ok: true, release: vi.fn() });
   hasSufficientEvmPaymentBalance.mockResolvedValue(true);
   // Default: wallet connected, wcExec returns whoami then sign result
   wcExec.mockImplementation((_cmd, args) => {
@@ -360,6 +360,25 @@ describe('createWalletConnectPaymentSignatures — option fallback', () => {
 
     await expect(collect([bsc(U), bsc(USD1)])).rejects.toThrow(/x402 payment signing failed/);
     expect(signCalls()).toHaveLength(1);
+  });
+
+  it('releases the session charge when the user rejects the signature', async () => {
+    const charge = { ok: true, release: vi.fn() };
+    chargeSessionSpend.mockReturnValue(charge);
+    wcExec.mockImplementation((_cmd, args) => Promise.resolve(
+      args[0] === 'whoami' ? JSON.stringify(BSC_SESSION) : 'Request rejected by wallet',
+    ));
+
+    await expect(collect([bsc(U)])).rejects.toThrow(/x402 payment signing failed/);
+    expect(charge.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the session charge once a signature is produced', async () => {
+    const charge = { ok: true, release: vi.fn() };
+    chargeSessionSpend.mockReturnValue(charge);
+
+    expect(await collect([bsc(U)])).toHaveLength(1);
+    expect(charge.release).not.toHaveBeenCalled();
   });
 });
 

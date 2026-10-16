@@ -257,6 +257,23 @@ describe('createPaymentSignatures — policy guard integration', () => {
     vi.doUnmock('../x402-svm.js');
   });
 
+  it('12f. session cap: a signer that throws does not use up the cap', async () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.01';
+    const createEvmSpy = mockEvmSigner();
+    createEvmSpy.mockImplementationOnce(() => { throw new Error('requirements.extra.name is required'); });
+    const { createPaymentSignatures } = await import('../x402.js');
+    mockFetch.mockResolvedValue({ json: async () => ({}) });
+
+    expect(await collectSignatures(createPaymentSignatures, makeRequirement(10_000n))).toHaveLength(0);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('requirements.extra.name is required'));
+
+    expect(await collectSignatures(createPaymentSignatures, makeRequirement(10_000n))).toHaveLength(1);
+    expect(createEvmSpy).toHaveBeenCalledTimes(2);
+
+    vi.doUnmock('../x402-evm.js');
+    vi.doUnmock('../x402-svm.js');
+  });
+
   it('11. over-cap amount → yields nothing, logs refusal, createEvmPaymentPayload not called', async () => {
     // $1001 worth of USDC (6 decimals) = well above the $1.00 default cap
     const overCapAmount = 1_001_000_000n; // $1001

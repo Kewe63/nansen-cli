@@ -539,9 +539,12 @@ describe("createPrivyPaymentSignatures", () => {
       extra: { feePayer: "11111111111111111111111111111111" },
     };
 
-    function stubPrivy() {
+    function stubPrivy({ failSigns = 0 } = {}) {
       const fetchMock = vi.fn(async (url, options) => {
         const body = typeof options?.body === "string" ? options.body : "";
+        if (/"method":"(eth_signTypedData_v4|signTransaction)"/.test(body) && failSigns-- > 0) {
+          return { ok: false, status: 500, statusText: "Internal Server Error", json: async () => ({ error: "signing unavailable" }), text: async () => "signing unavailable" };
+        }
         if (body.includes('"eth_call"')) return { ok: true, json: async () => ({ result: "0xc350" }) };
         if (body.includes('"getLatestBlockhash"')) {
           return { ok: true, json: async () => ({ result: { value: { blockhash: "GHtXQBpokCUCJwhRAJbhGVPKp9VTVn65CWVRqFMJkFwh" } } }) };
@@ -581,6 +584,22 @@ describe("createPrivyPaymentSignatures", () => {
 
       expect(signingCalls("eth_signTypedData_v4")).toBe(1);
       expect(errors).toHaveBeenCalledWith(expect.stringMatching(/^\[x402\] Refusing to auto-pay \$0\.05 USDC: .*NANSEN_X402_SESSION_MAX_AMOUNT/));
+      errors.mockRestore();
+    });
+
+    it.each([
+      ["EVM", () => evmRequirement, "eth_signTypedData_v4", "0.05"],
+      ["Solana", () => solRequirement, "signTransaction", "0.05"],
+    ])("does not use up the cap when Privy fails to sign a %s payment", async (_label, requirement, method, cap) => {
+      process.env.NANSEN_X402_SESSION_MAX_AMOUNT = cap;
+      const { signingCalls } = stubPrivy({ failSigns: 1 });
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      expect(await collect([requirement()])).toHaveLength(0);
+      expect(await collect([requirement()])).toHaveLength(1);
+
+      expect(signingCalls(method)).toBe(2);
+      expect(errors).toHaveBeenCalledWith(expect.stringMatching(/^\[x402\] Privy (EVM|Solana) signing failed/));
       errors.mockRestore();
     });
 

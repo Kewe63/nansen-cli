@@ -539,7 +539,7 @@ describe('chargeSessionSpend', () => {
   });
 
   it('always passes when the cap is unset', () => {
-    for (let i = 0; i < 1000; i++) expect(chargeSessionSpend(approve('1000000'))).toEqual({ ok: true });
+    for (let i = 0; i < 1000; i++) expect(chargeSessionSpend(approve('1000000')).ok).toBe(true);
   });
 
   it('allows payments up to and including the cap, then refuses', () => {
@@ -569,6 +569,19 @@ describe('chargeSessionSpend', () => {
     expect(chargeSessionSpend(approve('40000')).ok).toBe(true);
     expect(chargeSessionSpend(approve('20000')).ok).toBe(false);
     expect(chargeSessionSpend(approve('10000')).ok).toBe(true); // 0.04 + 0.01, not 0.04 + 0.02 + 0.01
+  });
+
+  it('returns a released charge to the total, once', () => {
+    process.env.NANSEN_X402_SESSION_MAX_AMOUNT = '0.02';
+    expect(chargeSessionSpend(approve('10000')).ok).toBe(true);
+    const failed = chargeSessionSpend(approve('10000'));
+    expect(failed.ok).toBe(true);
+    expect(chargeSessionSpend(approve('10000')).ok).toBe(false);
+
+    failed.release();
+    failed.release(); // a second release must not free more than was charged
+    expect(chargeSessionSpend(approve('10000')).ok).toBe(true);
+    expect(chargeSessionSpend(approve('10000')).ok).toBe(false);
   });
 
   it('rounds a sub-micro-dollar 18-decimal amount up rather than charging zero', () => {

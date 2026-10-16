@@ -126,13 +126,22 @@ async function buildPaymentForRequirement(requirement, exported, url) {
 }
 
 /**
- * Charge the session cap for an approved payment. Called synchronously right
- * before signing, after every async check that could still skip the option.
+ * Charge the session cap for an approved payment and run the synchronous
+ * signer. Called right before signing, after every async check that could
+ * still skip the option. The charge is released if the signer throws.
  */
-function chargeOrSkip(decision) {
+function chargeAndSign(decision, sign) {
   const charge = chargeSessionSpend(decision);
-  if (!charge.ok) console.error(`[x402] ${charge.reason}`);
-  return charge.ok;
+  if (!charge.ok) {
+    console.error(`[x402] ${charge.reason}`);
+    return null;
+  }
+  try {
+    return sign();
+  } catch (err) {
+    charge.release();
+    throw err;
+  }
 }
 
 /**
@@ -172,27 +181,25 @@ async function signApprovedRequirement(requirement, exported, url, decision) {
         return null;
       }
     }
-    if (!chargeOrSkip(decision)) return null;
-    return createEvmPaymentPayload(
+    return chargeAndSign(decision, () => createEvmPaymentPayload(
       requirement,
       exported.evm.privateKey,
       exported.evm.address,
       url,
-    );
+    ));
   }
 
   if (isSvmNetwork(requirement.network)) {
     if (!await hasSufficientSvmPaymentBalance(requirement, exported.solana.address)) return null;
     const rpcUrl = getSolanaRpcUrl(requirement.network);
     const blockhash = await fetchRecentBlockhash(rpcUrl);
-    if (!chargeOrSkip(decision)) return null;
-    return createSvmPaymentPayload(
+    return chargeAndSign(decision, () => createSvmPaymentPayload(
       requirement,
       exported.solana.privateKey,
       exported.solana.address,
       url,
       blockhash,
-    );
+    ));
   }
 
   return null;

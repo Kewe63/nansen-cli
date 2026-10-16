@@ -304,6 +304,7 @@ export async function* createPrivyPaymentSignatures(response, url) {
           console.error(`[x402] ${decision.reason}`);
           continue;
         }
+        let charge = null;
         try {
           if (!await hasSufficientEvmPaymentBalance(requirement, evmWallet.address)) continue;
           const typedData = buildEIP712TypedData({
@@ -312,7 +313,7 @@ export async function* createPrivyPaymentSignatures(response, url) {
           });
 
           // Charge the session cap with no await before the signing request.
-          const charge = chargeSessionSpend(decision);
+          charge = chargeSessionSpend(decision);
           if (!charge.ok) {
             console.error(`[x402] ${charge.reason}`);
             continue;
@@ -322,6 +323,7 @@ export async function* createPrivyPaymentSignatures(response, url) {
             typedData
           );
           const signature = signResult.data?.signature || signResult.signature;
+          if (!signature) throw new Error('Privy returned no signature');
 
           const authorization = {
             from: evmWallet.address,
@@ -341,6 +343,7 @@ export async function* createPrivyPaymentSignatures(response, url) {
 
           yield { signature: header, network: requirement.network, asset: requirement.asset, payment: decision };
         } catch (err) {
+          charge?.release?.();
           console.error(`[x402] Privy EVM signing failed for ${requirement.network}: ${err.message}`);
           continue;
         }
@@ -361,6 +364,7 @@ export async function* createPrivyPaymentSignatures(response, url) {
           console.error(`[x402] ${svmDecision.reason}`);
           continue;
         }
+        let charge = null;
         try {
           if (!await hasSufficientSvmPaymentBalance(requirement, solWallet.address)) continue;
           const rpcUrl = getSolanaRpcUrl(requirement.network);
@@ -372,13 +376,14 @@ export async function* createPrivyPaymentSignatures(response, url) {
             recentBlockhash,
           );
 
-          const charge = chargeSessionSpend(svmDecision);
+          charge = chargeSessionSpend(svmDecision);
           if (!charge.ok) {
             console.error(`[x402] ${charge.reason}`);
             continue;
           }
           const signResult = await client.signSolanaTransaction(solWallet.id, txBase64);
           const signedTx = signResult.data?.signed_transaction || signResult.signed_transaction;
+          if (!signedTx) throw new Error('Privy returned no signed transaction');
 
           const payload = {
             x402Version: 2,
@@ -392,6 +397,7 @@ export async function* createPrivyPaymentSignatures(response, url) {
           const header = Buffer.from(JSON.stringify(payload)).toString("base64");
           yield { signature: header, network: requirement.network, asset: requirement.asset, payment: svmDecision };
         } catch (err) {
+          charge?.release?.();
           console.error(`[x402] Privy Solana signing failed for ${requirement.network}: ${err.message}`);
           continue;
         }

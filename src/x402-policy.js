@@ -260,14 +260,16 @@ export function resolveSessionMaxMicroUsd() {
  * signature, so concurrent requests in one process can't both pass the check.
  *
  * `decision` is the { ok: true } result of evaluatePaymentRequirement.
- * Returns { ok: true } and adds the amount to the session total, or
- * { ok: false, reason } and leaves the total unchanged. A charged amount is
- * never refunded, even if the server later rejects the payment: the cap
- * bounds what this process signed, which can only over-count.
+ * Returns { ok: true, release } and adds the amount to the session total, or
+ * { ok: false, reason } and leaves the total unchanged. Call release() when
+ * signing fails or produces no signature, so the attempt doesn't use up the
+ * cap. Once a signature exists the charge stays, even if the server later
+ * rejects the payment: the cap bounds what this process signed, which can
+ * only over-count.
  */
 export function chargeSessionSpend(decision) {
   const cap = resolveSessionMaxMicroUsd();
-  if (cap === null) return { ok: true };
+  if (cap === null) return { ok: true, release: () => {} };
   if (typeof cap === 'object') return { ok: false, reason: cap.error };
 
   const known = resolveKnownToken(decision.network, decision.asset);
@@ -290,7 +292,13 @@ export function chargeSessionSpend(decision) {
     };
   }
   sessionSpentMicroUsd = total;
-  return { ok: true };
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    sessionSpentMicroUsd -= micro;
+  };
+  return { ok: true, release };
 }
 
 export function resetSessionSpendForTests() {
