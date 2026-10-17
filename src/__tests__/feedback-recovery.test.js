@@ -356,3 +356,38 @@ it.skipIf(process.platform === 'win32').each(['json', 'human'])('reports quota r
   expect(new Set(posts(h).map(req => req.headers['idempotency-key']))).toEqual(new Set([saved.submission_id]));
   expect(h.read()).toMatchObject({ state: 'confirmed', submission_id: saved.submission_id });
 });
+
+it('preserves the saved ID on rollout denial and distinguishes prior uncertainty', async () => {
+  for (const prior of [false, true]) {
+    const h = await harness();
+    if (prior) await killedPending(h);
+    h.post((_req, res) => reply(res, 403, { code: 'forbidden', reason: 'feedback_not_enabled', message: 'Not enabled for account.' }));
+    const result = await h.run(prior ? ['resume', '--json'] : h.submit);
+    const error = JSON.parse(result.stdout);
+    expect(error.details).toMatchObject({ reason: 'feedback_not_enabled', outcome: prior ? 'unknown' : 'rejected', submission_id: h.read().submission_id });
+    expect(result.stdout).toContain('Stop automatic retries'); expect(error.details.retry_command).toBeUndefined();
+    const saved = h.read(); expect(saved.state).toBe('pending'); expect(saved.body).toBe(h.body);
+    h.post((req, res) => reply(res, 200, receipt(req, { replayed: prior })));
+    expect((await h.run(['resume', '--json'])).code).toBe(0);
+    expect(h.read().submission_id).toBe(saved.submission_id);
+  }
+});
+
+it.each([
+  { status: 500, reason: 'internal_error', outcome: 'unknown' },
+  { status: 503, reason: 'feedback_store_unavailable', outcome: 'unknown' },
+  { status: 503, reason: 'feedback_admissions_paused', outcome: 'rejected' },
+])('retains recoverable journal after $reason then rollout denial', async ({ status, reason, outcome }) => {
+  const h = await harness(); let attempts = 0;
+  h.post((_req, res) => reply(res, ++attempts === 1 ? status : 403, attempts === 1
+    ? { code: 'upstream_unavailable', reason }
+    : { code: 'forbidden', reason: 'feedback_not_enabled' }));
+  const result = await h.run(h.submit); const saved = h.read();
+  expect(JSON.parse(result.stdout)).toMatchObject({ details: { outcome, reason: 'feedback_not_enabled', submission_id: saved.submission_id } });
+  expect(saved).toMatchObject({ state: 'pending', body: h.body });
+  expect(posts(h)).toHaveLength(2); expect(posts(h)[0].body).toBe(posts(h)[1].body);
+  expect(posts(h)[0].headers['idempotency-key']).toBe(posts(h)[1].headers['idempotency-key']);
+  h.post((req, res) => reply(res, 200, receipt(req, { replayed: outcome === 'unknown' })));
+  expect((await h.run(['resume', '--json'])).code).toBe(0);
+  expect(h.read()).toMatchObject({ state: 'confirmed', submission_id: saved.submission_id });
+});
