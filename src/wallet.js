@@ -30,6 +30,11 @@ const SCRYPT_KEYLEN = 32;
 const SALT_LEN = 16;
 const IV_LEN = 12;
 const _AUTH_TAG_LEN = 16;
+const WALLET_MUTATION_LOCK = '.wallet-mutation.lock';
+const WALLET_MUTATION_LOCK_WAIT_MS = 15000;
+const WALLET_MUTATION_LOCK_POLL_MS = 25;
+const LOCK_SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
+const HELD_WALLET_MUTATION_LOCKS = new Set();
 
 import { keccak256 } from './crypto.js';
 
@@ -233,6 +238,296 @@ export function mkdirPrivateSync(dir) {
 
 function ensureWalletsDir() {
   mkdirPrivateSync(getWalletsDir());
+}
+
+function sleepSync(ms) {
+  Atomics.wait(LOCK_SLEEP_CELL, 0, 0, ms);
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (err.code === 'ESRCH') return false;
+    if (err.code === 'EPERM') return true;
+    throw err;
+  }
+}
+
+function readLockJson(filePath, label) {
+  let stat;
+  try {
+    stat = fs.lstatSync(filePath);
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      const wrapped = new Error(`Wallet mutation lock is invalid: missing ${label}. Stop other wallet commands, remove ${path.dirname(filePath)}, and retry.`, { cause: err });
+      wrapped.code = err.code;
+      throw wrapped;
+    }
+    throw err;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`Wallet mutation lock is invalid: ${label} must be a regular file. Stop other wallet commands, remove ${path.dirname(filePath)}, and retry.`);
+  }
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (err) {
+    const wrapped = new Error(`Wallet mutation lock is invalid: ${label} is not valid JSON. Stop other wallet commands, remove ${path.dirname(filePath)}, and retry.`, { cause: err });
+    if (err.code) wrapped.code = err.code;
+    throw wrapped;
+  }
+}
+
+function validateLockRecord(record, label, { ownerToken = null } = {}) {
+  const valid = record
+    && Number.isSafeInteger(record.pid)
+    && record.pid > 0
+    && typeof record.token === 'string'
+    && /^[a-f0-9]{32}$/.test(record.token)
+    && typeof record.createdAt === 'string'
+    && !Number.isNaN(Date.parse(record.createdAt));
+  if (!valid || (ownerToken !== null && record.ownerToken !== ownerToken)) {
+    throw new Error(`Wallet mutation lock is invalid: malformed ${label}. Stop other wallet commands, remove the lock directory, and retry.`);
+  }
+  return record;
+}
+
+function inspectWalletMutationLock(lockPath) {
+  const stat = fs.lstatSync(lockPath);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`Wallet mutation lock is invalid: ${lockPath} must be a real directory. Stop other wallet commands, remove it, and retry.`);
+  }
+  return validateLockRecord(readLockJson(path.join(lockPath, 'owner.json'), 'owner metadata'), 'owner metadata');
+}
+
+function recoverDeadWalletMutationLock(lockPath, owner) {
+  const recoveryPath = path.join(lockPath, 'recovery.json');
+  const recoveryToken = crypto.randomBytes(16).toString('hex');
+  const recoveryCandidatePath = path.join(lockPath, `.recovery-${process.pid}-${recoveryToken}.candidate`);
+  const recovery = {
+    pid: process.pid,
+    token: recoveryToken,
+    ownerToken: owner.token,
+    createdAt: new Date().toISOString(),
+  };
+
+  try {
+    // Publish complete recovery metadata with an exclusive hard link. Opening
+    // recovery.json directly with "wx" exposes an empty/partial file to other
+    // contenders between open and write.
+    writePrivateJson(recoveryCandidatePath, recovery);
+    fs.linkSync(recoveryCandidatePath, recoveryPath);
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    if (err.code !== 'EEXIST') throw err;
+    let existing;
+    try {
+      existing = validateLockRecord(readLockJson(recoveryPath, 'recovery marker'), 'recovery marker');
+    } catch (readErr) {
+      if (readErr.code === 'ENOENT') return false;
+      throw readErr;
+    }
+    if (existing.ownerToken !== owner.token) {
+      try { fs.unlinkSync(recoveryPath); } catch (unlinkErr) { if (unlinkErr.code !== 'ENOENT') throw unlinkErr; }
+      return false;
+    }
+    if (processIsAlive(existing.pid)) return false;
+    try { fs.unlinkSync(recoveryPath); } catch (unlinkErr) { if (unlinkErr.code !== 'ENOENT') throw unlinkErr; }
+    return false;
+  } finally {
+    try { fs.unlinkSync(recoveryCandidatePath); } catch { /* lock may have been quarantined */ }
+  }
+
+  let currentOwner;
+  try {
+    currentOwner = inspectWalletMutationLock(lockPath);
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
+  }
+  if (currentOwner.token !== owner.token) return false;
+
+  const stalePath = path.join(
+    getWalletsDir(),
+    `${WALLET_MUTATION_LOCK}.stale-${process.pid}-${recoveryToken}`,
+  );
+  try {
+    fs.renameSync(lockPath, stalePath);
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
+  }
+
+  const staleOwner = validateLockRecord(
+    readLockJson(path.join(stalePath, 'owner.json'), 'stale owner metadata'),
+    'stale owner metadata',
+  );
+  const staleRecovery = validateLockRecord(
+    readLockJson(path.join(stalePath, 'recovery.json'), 'stale recovery marker'),
+    'stale recovery marker',
+    { ownerToken: owner.token },
+  );
+  if (staleOwner.token !== owner.token || staleRecovery.token !== recoveryToken) {
+    throw new Error('Wallet mutation lock ownership changed during stale-lock recovery; refusing to delete the quarantined directory.');
+  }
+  fs.rmSync(stalePath, { recursive: true, force: true });
+  return true;
+}
+
+function releaseWalletMutationLock(lockPath, token) {
+  const owner = inspectWalletMutationLock(lockPath);
+  if (owner.token !== token) {
+    throw new Error('Wallet mutation lock ownership changed before release; refusing to remove another process lock.');
+  }
+
+  const releasedPath = path.join(getWalletsDir(), `${WALLET_MUTATION_LOCK}.released-${process.pid}-${token}`);
+  fs.renameSync(lockPath, releasedPath);
+  const releasedOwner = validateLockRecord(
+    readLockJson(path.join(releasedPath, 'owner.json'), 'released owner metadata'),
+    'released owner metadata',
+  );
+  if (releasedOwner.token !== token) {
+    try { fs.renameSync(releasedPath, lockPath); } catch { /* preserve the unexpected directory */ }
+    throw new Error('Wallet mutation lock ownership changed during release; refusing to remove another process lock.');
+  }
+  fs.rmSync(releasedPath, { recursive: true, force: true });
+}
+
+export class WalletMutationCommittedError extends Error {
+  constructor(releaseError) {
+    super(`Wallet mutation committed, but releasing the mutation lock failed: ${releaseError.message}`, { cause: releaseError });
+    this.name = 'WalletMutationCommittedError';
+    this.code = 'WALLET_MUTATION_COMMITTED_LOCK_RELEASE_FAILED';
+    this.committed = true;
+    this.releaseError = releaseError;
+  }
+}
+
+/**
+ * Serialize complete wallet read-check-write mutations across processes.
+ * The prepared directory is atomically renamed into place, so readers never
+ * observe partial owner metadata. Dead owners are quarantined before cleanup;
+ * cleanup therefore cannot remove a successor's newly acquired lock.
+ * The callback must be synchronous; returning a Promise is rejected so the
+ * lock cannot be released while an asynchronous mutation is still running.
+ */
+export function withWalletMutationLock(fn, {
+  waitMs = WALLET_MUTATION_LOCK_WAIT_MS,
+  pollMs = WALLET_MUTATION_LOCK_POLL_MS,
+} = {}) {
+  ensureWalletsDir();
+  const walletsDir = getWalletsDir();
+  const lockPath = path.join(walletsDir, WALLET_MUTATION_LOCK);
+  if (HELD_WALLET_MUTATION_LOCKS.has(lockPath)) {
+    throw new Error('Wallet mutation lock is not reentrant; nested wallet mutations in the same process are not allowed.');
+  }
+
+  const token = crypto.randomBytes(16).toString('hex');
+  const candidatePath = path.join(walletsDir, `${WALLET_MUTATION_LOCK}.candidate-${process.pid}-${token}`);
+  mkdirPrivateSync(candidatePath);
+  writePrivateJson(path.join(candidatePath, 'owner.json'), {
+    pid: process.pid,
+    token,
+    createdAt: new Date().toISOString(),
+  });
+
+  const deadline = Date.now() + waitMs;
+  let acquired = false;
+  try {
+    while (!acquired) {
+      try {
+        fs.renameSync(candidatePath, lockPath);
+        acquired = true;
+        break;
+      } catch (_err) {
+        let lockExists = false;
+        try {
+          fs.lstatSync(lockPath);
+          lockExists = true;
+        } catch (statErr) {
+          if (statErr.code !== 'ENOENT') throw statErr;
+        }
+        // Another releaser/recoverer may remove the destination after rename
+        // reports EEXIST/ENOTEMPTY. The still-valid candidate can retry.
+        if (!lockExists) continue;
+      }
+
+      let owner;
+      try {
+        owner = inspectWalletMutationLock(lockPath);
+      } catch (err) {
+        // A competing stale-lock recovery may have quarantined the directory
+        // or its metadata after our existence check. Retry the candidate.
+        if (err.code === 'ENOENT') continue;
+        throw err;
+      }
+      if (!processIsAlive(owner.pid)) {
+        const recovered = recoverDeadWalletMutationLock(lockPath, owner);
+        if (recovered) continue;
+        if (Date.now() >= deadline) {
+          throw new Error('Wallet mutation lock is busy while another process recovers a dead owner. Wait for recovery to finish and retry.');
+        }
+        sleepSync(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Wallet mutation lock is busy (held by process ${owner.pid}). Wait for the other wallet command to finish and retry.`);
+      }
+      sleepSync(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+    }
+
+    HELD_WALLET_MUTATION_LOCKS.add(lockPath);
+    let result;
+    let callbackError;
+    let callbackFailed = false;
+    try {
+      result = fn();
+      if (result && typeof result.then === 'function') {
+        if (typeof result.catch === 'function') result.catch(() => {});
+        throw new TypeError('Wallet mutation lock callbacks must be synchronous and must not return a Promise.');
+      }
+    } catch (err) {
+      callbackFailed = true;
+      callbackError = err;
+    }
+
+    let releaseError;
+    try {
+      releaseWalletMutationLock(lockPath, token);
+      acquired = false;
+    } catch (err) {
+      releaseError = err;
+    } finally {
+      HELD_WALLET_MUTATION_LOCKS.delete(lockPath);
+    }
+
+    if (callbackFailed) {
+      if (releaseError && callbackError && (typeof callbackError === 'object' || typeof callbackError === 'function')) {
+        try { callbackError.releaseError = releaseError; } catch { /* preserve immutable primary errors */ }
+      }
+      throw callbackError;
+    }
+    if (releaseError) throw new WalletMutationCommittedError(releaseError);
+    return result;
+  } finally {
+    if (acquired) {
+      try { releaseWalletMutationLock(lockPath, token); } catch { /* the primary error already reports release failure */ }
+    } else {
+      fs.rmSync(candidatePath, { recursive: true, force: true });
+    }
+    HELD_WALLET_MUTATION_LOCKS.delete(lockPath);
+  }
+}
+
+function writePrivateJson(filePath, value) {
+  const fd = fs.openSync(filePath, 'wx', 0o600);
+  try {
+    fs.fchmodSync(fd, 0o600);
+    fs.writeFileSync(fd, JSON.stringify(value));
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /**
@@ -497,6 +792,10 @@ export function listWallets() {
  * Create a new wallet pair (EVM + Solana).
  */
 export function createWallet(name, password) {
+  return withWalletMutationLock(() => createWalletUnlocked(name, password));
+}
+
+function createWalletUnlocked(name, password) {
   ensureWalletsDir();
   const config = getWalletConfig();
   const walletFile = getWalletFile(name);
@@ -624,48 +923,52 @@ export function exportWallet(name, password) {
  * Set the default wallet.
  */
 export function setDefaultWallet(name) {
-  requireWalletFile(name);
+  return withWalletMutationLock(() => {
+    requireWalletFile(name);
 
-  const config = getWalletConfig();
-  config.defaultWallet = name;
-  saveWalletConfig(config);
+    const config = getWalletConfig();
+    config.defaultWallet = name;
+    saveWalletConfig(config);
 
-  return { defaultWallet: name };
+    return { defaultWallet: name };
+  });
 }
 
 /**
  * Delete a wallet.
  */
 export async function deleteWallet(name, password) {
-  const walletFile = requireWalletFile(name);
+  return withWalletMutationLock(() => {
+    const walletFile = requireWalletFile(name);
 
-  const data = readWalletJson(walletFile);
-  const config = getWalletConfig();
+    const data = readWalletJson(walletFile);
+    const config = getWalletConfig();
 
-  if (data.provider && data.provider !== 'local') {
-    // Non-local wallets: just remove local reference, no password needed
-  } else {
-    if (config.passwordHash && !verifyPassword(password, config)) {
-      throw new Error('Incorrect password');
+    if (data.provider && data.provider !== 'local') {
+      // Non-local wallets: just remove local reference, no password needed
+    } else {
+      if (config.passwordHash && !verifyPassword(password, config)) {
+        throw new Error('Incorrect password');
+      }
     }
-  }
 
-  fs.unlinkSync(walletFile);
+    fs.unlinkSync(walletFile);
 
-  const remaining = fs.readdirSync(getWalletsDir())
-    .filter(f => f.endsWith('.json') && f !== 'config.json')
-    .filter(f => { try { readWalletJson(path.join(getWalletsDir(), f)); return true; } catch { return false; } });
+    const remaining = fs.readdirSync(getWalletsDir())
+      .filter(f => f.endsWith('.json') && f !== 'config.json')
+      .filter(f => { try { readWalletJson(path.join(getWalletsDir(), f)); return true; } catch { return false; } });
 
-  if (remaining.length === 0) {
-    config.defaultWallet = null;
-    config.passwordHash = null;
-    deletePassword();
-  } else if (config.defaultWallet === name) {
-    config.defaultWallet = remaining[0].replace('.json', '');
-  }
-  saveWalletConfig(config);
+    if (remaining.length === 0) {
+      config.defaultWallet = null;
+      config.passwordHash = null;
+      deletePassword();
+    } else if (config.defaultWallet === name) {
+      config.defaultWallet = remaining[0].replace('.json', '');
+    }
+    saveWalletConfig(config);
 
-  return { deleted: name, newDefault: config.defaultWallet };
+    return { deleted: name, newDefault: config.defaultWallet };
+  });
 }
 
 // ============= CLI Command Builder =============
