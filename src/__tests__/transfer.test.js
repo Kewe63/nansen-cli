@@ -1195,8 +1195,8 @@ describe('sendTokens via Privy', () => {
       dryRun: true,
     })).rejects.toThrow(/does not match/);
 
+    expect(getWalletSpy).toHaveBeenCalledOnce();
     expect(sendSpy).not.toHaveBeenCalled();
-    expect(fetch).not.toHaveBeenCalled();
     sendSpy.mockRestore();
   });
 
@@ -1212,9 +1212,18 @@ describe('sendTokens via Privy', () => {
       dryRun: true,
     })).rejects.toThrow(/does not match/);
 
+    expect(getWalletSpy).toHaveBeenCalledOnce();
     expect(signSpy).not.toHaveBeenCalled();
-    expect(fetch).not.toHaveBeenCalled();
     signSpy.mockRestore();
+  });
+
+  test('rejects an unsupported EVM chain before looking up the Privy wallet', async () => {
+    await expect(sendTokens({
+      to: '0x742d35Cc6bF4F3f4e0e3a8DD7e37ff4e4Be4E4B4',
+      amount: '0.01', chain: 'unknown', wallet: 'pv', dryRun: true,
+    })).rejects.toThrow(/Unsupported chain/);
+
+    expect(getWalletSpy).not.toHaveBeenCalled();
   });
 
   test('sends native ETH via Privy sendTransaction', async () => {

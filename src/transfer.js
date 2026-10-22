@@ -672,6 +672,8 @@ async function sendTokensViaPrivy({ to, amount, chain, token, max, dryRun, walle
     const fromAddress = walletInfo.solana;
     if (!fromAddress) throw new Error('No Solana wallet in this Privy wallet');
     if (!walletId) throw new Error('No Privy Solana wallet ID found. Re-create the wallet with: nansen wallet create --provider privy');
+    if (token && !validateSolanaAddress(token).valid) throw new Error('Invalid Solana token address');
+    if (!max && !token) parseAmount(amount, 9);
     await assertPrivyWalletAddress(client, walletId, fromAddress, 'solana');
 
     if (max && !token) {
@@ -713,10 +715,12 @@ async function sendTokensViaPrivy({ to, amount, chain, token, max, dryRun, walle
   const fromAddress = walletInfo.evm;
   if (!fromAddress) throw new Error('No EVM wallet in this Privy wallet');
   if (!walletId) throw new Error('No Privy EVM wallet ID found. Re-create the wallet with: nansen wallet create --provider privy');
-  await assertPrivyWalletAddress(client, walletId, fromAddress, 'evm');
 
   const chainId = CHAIN_IDS[chain];
   if (!chainId) throw new Error(`Unsupported chain: ${chain}`);
+  if (token && !validateEvmAddress(token).valid) throw new Error('Invalid ERC-20 token address');
+  if (!max && !token) parseAmount(amount, 18);
+  await assertPrivyWalletAddress(client, walletId, fromAddress, 'evm');
 
   let decimals = 18;
   const rpcUrl = CHAIN_RPCS[chain] || CHAIN_RPCS.evm;
