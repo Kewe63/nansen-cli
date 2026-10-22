@@ -290,6 +290,25 @@ describe('wallet mutation concurrency', () => {
     expect(fs.readdirSync(walletsDir).filter(file => file.includes('.stale-'))).toEqual([]);
   });
 
+  it.skipIf(process.platform !== 'linux')('recovers a stale lock when its PID has been reused', async () => {
+    const { home, walletsDir } = fixture();
+    const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
+    fs.mkdirSync(lockPath);
+    fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
+      pid: process.pid,
+      token: 'd'.repeat(32),
+      identity: 'linux:00000000-0000-0000-0000-000000000000:0',
+      createdAt: new Date().toISOString(),
+    }));
+
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    const walletUrl = pathToFileURL(path.join(repo, 'src', 'wallet.js')).href;
+    const { withWalletMutationLock } = await import(`${walletUrl}?pid-reuse=${Date.now()}`);
+    expect(withWalletMutationLock(() => 'recovered')).toBe('recovered');
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
   it('lets many contenders recover the same dead owner and recovery marker', async () => {
     const { home, markerDir, walletsDir } = fixture();
     const deadPid = await getDeadPid();

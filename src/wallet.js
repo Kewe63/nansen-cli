@@ -244,15 +244,35 @@ function sleepSync(ms) {
   Atomics.wait(LOCK_SLEEP_CELL, 0, 0, ms);
 }
 
-function processIsAlive(pid) {
+function linuxProcessIdentity(pid) {
+  if (process.platform !== 'linux') return null;
+  // pid is validated as a positive safe integer before this fixed /proc path
+  // is used. Field 22 is the process start time in kernel clock ticks; pairing
+  // it with the boot ID distinguishes a reused PID from the original owner.
   try {
-    process.kill(pid, 0);
-    return true;
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const end = stat.lastIndexOf(')');
+    const fields = end === -1 ? [] : stat.slice(end + 2).trim().split(/\s+/);
+    const started = fields[19];
+    const boot = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    return started && boot ? `linux:${boot}:${started}` : null;
   } catch (err) {
-    if (err.code === 'ESRCH') return false;
-    if (err.code === 'EPERM') return true;
+    if (err.code === 'ENOENT' || err.code === 'ESRCH') return null;
     throw err;
   }
+}
+
+function processIsAlive(owner) {
+  const { pid } = owner;
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    if (err.code === 'ESRCH') return false;
+    if (err.code !== 'EPERM') throw err;
+  }
+  if (!owner.identity) return true;
+  const currentIdentity = linuxProcessIdentity(pid);
+  return currentIdentity !== null && currentIdentity === owner.identity;
 }
 
 function readLockJson(filePath, label) {
@@ -286,7 +306,9 @@ function validateLockRecord(record, label, { ownerToken = null } = {}) {
     && typeof record.token === 'string'
     && /^[a-f0-9]{32}$/.test(record.token)
     && typeof record.createdAt === 'string'
-    && !Number.isNaN(Date.parse(record.createdAt));
+    && !Number.isNaN(Date.parse(record.createdAt))
+    && (record.identity === undefined || record.identity === null ||
+      (typeof record.identity === 'string' && /^[A-Za-z0-9:._-]{1,200}$/.test(record.identity)));
   if (!valid || (ownerToken !== null && record.ownerToken !== ownerToken)) {
     throw new Error(`Wallet mutation lock is invalid: malformed ${label}. Stop other wallet commands, remove the lock directory, and retry.`);
   }
@@ -309,6 +331,7 @@ function recoverDeadWalletMutationLock(lockPath, owner) {
     pid: process.pid,
     token: recoveryToken,
     ownerToken: owner.token,
+    identity: linuxProcessIdentity(process.pid),
     createdAt: new Date().toISOString(),
   };
 
@@ -332,7 +355,7 @@ function recoverDeadWalletMutationLock(lockPath, owner) {
       try { fs.unlinkSync(recoveryPath); } catch (unlinkErr) { if (unlinkErr.code !== 'ENOENT') throw unlinkErr; }
       return false;
     }
-    if (processIsAlive(existing.pid)) return false;
+    if (processIsAlive(existing)) return false;
     try { fs.unlinkSync(recoveryPath); } catch (unlinkErr) { if (unlinkErr.code !== 'ENOENT') throw unlinkErr; }
     return false;
   } finally {
@@ -429,6 +452,7 @@ export function withWalletMutationLock(fn, {
   writePrivateJson(path.join(candidatePath, 'owner.json'), {
     pid: process.pid,
     token,
+    identity: linuxProcessIdentity(process.pid),
     createdAt: new Date().toISOString(),
   });
 
@@ -462,7 +486,7 @@ export function withWalletMutationLock(fn, {
         if (err.code === 'ENOENT') continue;
         throw err;
       }
-      if (!processIsAlive(owner.pid)) {
+      if (!processIsAlive(owner)) {
         const recovered = recoverDeadWalletMutationLock(lockPath, owner);
         if (recovered) continue;
         if (Date.now() >= deadline) {
