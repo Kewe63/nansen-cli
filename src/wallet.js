@@ -8,6 +8,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import * as readline from 'readline';
+import { execFileSync } from 'node:child_process';
 import { base58 } from '@scure/base';
 import { storePassword, retrievePassword, deletePassword, deleteCredentialsFile } from './keychain.js';
 import { CommandError } from './api.js';
@@ -244,20 +245,43 @@ function sleepSync(ms) {
   Atomics.wait(LOCK_SLEEP_CELL, 0, 0, ms);
 }
 
-function linuxProcessIdentity(pid) {
-  if (process.platform !== 'linux') return null;
-  // pid is validated as a positive safe integer before this fixed /proc path
-  // is used. Field 22 is the process start time in kernel clock ticks; pairing
-  // it with the boot ID distinguishes a reused PID from the original owner.
+function processIdentity(pid) {
   try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const end = stat.lastIndexOf(')');
-    const fields = end === -1 ? [] : stat.slice(end + 2).trim().split(/\s+/);
-    const started = fields[19];
-    const boot = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    return started && boot ? `linux:${boot}:${started}` : null;
+    if (process.platform === 'linux' || process.platform === 'android') {
+      // pid is validated as a positive safe integer before this fixed /proc path
+      // is used. Field 22 is the process start time in kernel clock ticks; pairing
+      // it with the boot ID distinguishes a reused PID from the original owner on
+      // Linux and Android, which expose the same procfs identity fields.
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const end = stat.lastIndexOf(')');
+      const fields = end === -1 ? [] : stat.slice(end + 2).trim().split(/\s+/);
+      const started = fields[19];
+      const boot = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+      return started && boot ? `${process.platform}:${boot}:${started}` : null;
+    }
+    if (process.platform === 'darwin') {
+      const started = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      const digest = crypto.createHash('sha256').update(started).digest('hex');
+      return started ? `darwin:${digest}` : null;
+    }
+    if (process.platform === 'win32') {
+      const started = execFileSync('powershell.exe', [
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`,
+      ], {
+        encoding: 'utf8',
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      return /^\d+$/.test(started) ? `win32:${started}` : null;
+    }
+    return null;
   } catch (err) {
     if (err.code === 'ENOENT' || err.code === 'ESRCH') return null;
+    if (typeof err.status === 'number' && err.status !== 0) return null;
     throw err;
   }
 }
@@ -270,9 +294,24 @@ function processIsAlive(owner) {
     if (err.code === 'ESRCH') return false;
     if (err.code !== 'EPERM') throw err;
   }
-  if (!owner.identity) return true;
-  const currentIdentity = linuxProcessIdentity(pid);
-  return currentIdentity !== null && currentIdentity === owner.identity;
+  const currentIdentity = processIdentity(pid);
+  if (currentIdentity === null) {
+    try {
+      process.kill(pid, 0);
+    } catch (err) {
+      if (err.code === 'ESRCH') return false;
+      if (err.code !== 'EPERM') throw err;
+    }
+    throw new Error(`Wallet mutation lock cannot verify the identity of live process ${pid} on ${process.platform}; refusing unsafe PID-only recovery.`);
+  }
+  return currentIdentity === owner.identity;
+}
+
+function lockTokensEqual(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string' || left.length !== right.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(Buffer.from(left), Buffer.from(right));
 }
 
 function readLockJson(filePath, label) {
@@ -309,19 +348,17 @@ function validateLockRecord(record, label, { ownerToken = null } = {}) {
     && /^[a-f0-9]{32}$/.test(record.token)
     && typeof record.createdAt === 'string'
     && !Number.isNaN(Date.parse(record.createdAt))
-    && (process.platform === 'linux'
-      ? validIdentity
-      : (record.identity === undefined || record.identity === null || validIdentity));
-  if (!valid || (ownerToken !== null && record.ownerToken !== ownerToken)) {
+    && validIdentity;
+  if (!valid || (ownerToken !== null && !lockTokensEqual(record.ownerToken, ownerToken))) {
     throw new Error(`Wallet mutation lock is invalid: malformed ${label}. Stop other wallet commands, remove the lock directory, and retry.`);
   }
   return record;
 }
 
 function currentLockIdentity() {
-  const identity = linuxProcessIdentity(process.pid);
-  if (process.platform === 'linux' && !identity) {
-    throw new Error('Wallet mutation lock cannot establish the current Linux process identity; refusing unsafe PID-only locking.');
+  const identity = processIdentity(process.pid);
+  if (!identity) {
+    throw new Error(`Wallet mutation lock cannot establish the current process identity on ${process.platform}; refusing unsafe PID-only locking.`);
   }
   return identity;
 }
@@ -410,8 +447,8 @@ function recoverDeadWalletMutationLock(lockPath, owner) {
     // The caller's owner snapshot may predate a handoff. Never remove a marker
     // merely because it names a different owner: it may be the successor's live
     // recovery claim.
-    if (canonicalOwner.token !== owner.token) return false;
-    if (existing.ownerToken !== canonicalOwner.token) {
+    if (!lockTokensEqual(canonicalOwner.token, owner.token)) return false;
+    if (!lockTokensEqual(existing.ownerToken, canonicalOwner.token)) {
       throw new Error('Wallet mutation lock is invalid: recovery marker does not match its owner. Stop other wallet commands, remove the lock directory, and retry.', { cause: err });
     }
     if (processIsAlive(existing)) return false;
@@ -427,7 +464,7 @@ function recoverDeadWalletMutationLock(lockPath, owner) {
     if (err.code === 'ENOENT') return false;
     throw err;
   }
-  if (currentOwner.token !== owner.token) {
+  if (!lockTokensEqual(currentOwner.token, owner.token)) {
     removeOwnRecoveryClaim(publishedClaim, recoveryPath);
     return false;
   }
@@ -452,7 +489,8 @@ function recoverDeadWalletMutationLock(lockPath, owner) {
     'stale recovery marker',
     { ownerToken: owner.token },
   );
-  if (staleOwner.token !== owner.token || staleRecovery.token !== recoveryToken) {
+  if (!lockTokensEqual(staleOwner.token, owner.token) ||
+      !lockTokensEqual(staleRecovery.token, recoveryToken)) {
     throw new Error('Wallet mutation lock ownership changed during stale-lock recovery; refusing to delete the quarantined directory.');
   }
   fs.rmSync(stalePath, { recursive: true, force: true });
@@ -461,7 +499,7 @@ function recoverDeadWalletMutationLock(lockPath, owner) {
 
 function releaseWalletMutationLock(lockPath, token) {
   const owner = inspectWalletMutationLock(lockPath);
-  if (owner.token !== token) {
+  if (!lockTokensEqual(owner.token, token)) {
     throw new Error('Wallet mutation lock ownership changed before release; refusing to remove another process lock.');
   }
 
@@ -471,7 +509,7 @@ function releaseWalletMutationLock(lockPath, token) {
     readLockJson(path.join(releasedPath, 'owner.json'), 'released owner metadata'),
     'released owner metadata',
   );
-  if (releasedOwner.token !== token) {
+  if (!lockTokensEqual(releasedOwner.token, token)) {
     try { fs.renameSync(releasedPath, lockPath); } catch { /* preserve the unexpected directory */ }
     throw new Error('Wallet mutation lock ownership changed during release; refusing to remove another process lock.');
   }

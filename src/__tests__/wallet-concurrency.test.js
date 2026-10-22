@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -65,17 +66,30 @@ function getDeadPid() {
 }
 
 function syntheticIdentity() {
-  return process.platform === 'linux'
-    ? 'linux:00000000-0000-0000-0000-000000000000:0'
-    : undefined;
+  return 'test:00000000000000000000000000000000';
 }
 
 function currentIdentity() {
-  if (process.platform !== 'linux') return undefined;
-  const stat = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8');
-  const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
-  const boot = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-  return `linux:${boot}:${fields[19]}`;
+  if (process.platform === 'linux' || process.platform === 'android') {
+    const stat = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+    const boot = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    return `${process.platform}:${boot}:${fields[19]}`;
+  }
+  if (process.platform === 'darwin') {
+    const started = execFileSync('/bin/ps', ['-o', 'lstart=', '-p', String(process.pid)], {
+      encoding: 'utf8',
+    }).trim();
+    return `darwin:${crypto.createHash('sha256').update(started).digest('hex')}`;
+  }
+  if (process.platform === 'win32') {
+    const started = execFileSync('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+      `(Get-Process -Id ${process.pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`,
+    ], { encoding: 'utf8', windowsHide: true }).trim();
+    return `win32:${started}`;
+  }
+  throw new Error(`unsupported test platform: ${process.platform}`);
 }
 
 function fixture() {
@@ -335,14 +349,14 @@ describe('wallet mutation concurrency', () => {
     expect(fs.existsSync(path.join(lockPath, 'recovery.json'))).toBe(true);
   });
 
-  it.skipIf(process.platform !== 'linux')('recovers a stale lock when its PID has been reused', async () => {
+  it.skipIf(process.platform === 'android')('recovers a stale lock when its PID has been reused', async () => {
     const { home, walletsDir } = fixture();
     const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
     fs.mkdirSync(lockPath);
     fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
       pid: process.pid,
       token: 'd'.repeat(32),
-      identity: 'linux:00000000-0000-0000-0000-000000000000:0',
+      identity: syntheticIdentity(),
       createdAt: new Date().toISOString(),
     }));
 
@@ -354,7 +368,7 @@ describe('wallet mutation concurrency', () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  it.skipIf(process.platform !== 'linux')('rejects a stable lock record without process identity', async () => {
+  it('rejects a stable lock record without process identity', async () => {
     const { home, walletsDir } = fixture();
     const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
     fs.mkdirSync(lockPath);
@@ -372,7 +386,7 @@ describe('wallet mutation concurrency', () => {
       .toThrow(/malformed owner metadata/i);
   });
 
-  it.skipIf(process.platform !== 'linux')('rejects a recovery record without process identity', async () => {
+  it('rejects a recovery record without process identity', async () => {
     const { home, walletsDir } = fixture();
     const deadPid = await getDeadPid();
     const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
