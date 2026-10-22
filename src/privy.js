@@ -152,6 +152,47 @@ export class PrivyClient {
 
 // ============= Helpers =============
 
+function extractPrivyWalletAddress(response) {
+  return response?.address
+    ?? response?.data?.address
+    ?? response?.wallet?.address
+    ?? response?.data?.wallet?.address
+    ?? null;
+}
+
+/**
+ * Resolve a Privy wallet ID and bind it to the address stored locally before
+ * any preview, screening, or signing can rely on that address.
+ */
+export async function assertPrivyWalletAddress(client, walletId, expectedAddress, chainType) {
+  if (!walletId) {
+    throw new Error(`No Privy ${chainType === 'solana' ? 'Solana' : 'EVM'} wallet ID found. Re-create the wallet with: nansen wallet create --provider privy`);
+  }
+  if (!expectedAddress) {
+    throw new Error(`No ${chainType === 'solana' ? 'Solana' : 'EVM'} address is stored for this Privy wallet. Re-create the wallet with: nansen wallet create --provider privy`);
+  }
+  if (chainType !== 'evm' && chainType !== 'solana') {
+    throw new Error(`Unsupported Privy wallet chain type: ${chainType}`);
+  }
+
+  const response = await client.getWallet(walletId);
+  const authoritativeAddress = extractPrivyWalletAddress(response);
+  if (typeof authoritativeAddress !== 'string' || authoritativeAddress.length === 0) {
+    throw new Error(`Privy wallet ID "${walletId}" returned no address. Re-create the wallet with: nansen wallet create --provider privy`);
+  }
+
+  const matches = chainType === 'evm'
+    ? authoritativeAddress.toLowerCase() === String(expectedAddress).toLowerCase()
+    : authoritativeAddress === expectedAddress;
+  if (!matches) {
+    throw new Error(
+      `Privy wallet ID "${walletId}" resolves to ${authoritativeAddress}, but the local wallet records ${expectedAddress}; it does not match. Re-create the wallet with: nansen wallet create --provider privy`,
+    );
+  }
+
+  return authoritativeAddress;
+}
+
 function getClient() {
   return new PrivyClient(process.env.PRIVY_APP_ID, process.env.PRIVY_APP_SECRET);
 }

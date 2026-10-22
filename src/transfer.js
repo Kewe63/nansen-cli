@@ -664,7 +664,7 @@ export { parseAmount, formatAmount, signEd25519, encodeCompactU16, base58Decode,
  * Solana builds unsigned tx, signs via Privy, then broadcasts.
  */
 async function sendTokensViaPrivy({ to, amount, chain, token, max, dryRun, walletInfo }) {
-  const { PrivyClient } = await import('./privy.js');
+  const { PrivyClient, assertPrivyWalletAddress } = await import('./privy.js');
   const client = new PrivyClient(process.env.PRIVY_APP_ID, process.env.PRIVY_APP_SECRET);
 
   if (chain === 'solana') {
@@ -672,6 +672,7 @@ async function sendTokensViaPrivy({ to, amount, chain, token, max, dryRun, walle
     const fromAddress = walletInfo.solana;
     if (!fromAddress) throw new Error('No Solana wallet in this Privy wallet');
     if (!walletId) throw new Error('No Privy Solana wallet ID found. Re-create the wallet with: nansen wallet create --provider privy');
+    await assertPrivyWalletAddress(client, walletId, fromAddress, 'solana');
 
     if (max && !token) {
       const balResult = await rpcCall(CHAIN_RPCS.solana, 'getBalance', [fromAddress, { commitment: 'confirmed' }]);
@@ -712,6 +713,7 @@ async function sendTokensViaPrivy({ to, amount, chain, token, max, dryRun, walle
   const fromAddress = walletInfo.evm;
   if (!fromAddress) throw new Error('No EVM wallet in this Privy wallet');
   if (!walletId) throw new Error('No Privy EVM wallet ID found. Re-create the wallet with: nansen wallet create --provider privy');
+  await assertPrivyWalletAddress(client, walletId, fromAddress, 'evm');
 
   const chainId = CHAIN_IDS[chain];
   if (!chainId) throw new Error(`Unsupported chain: ${chain}`);
