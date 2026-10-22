@@ -64,6 +64,20 @@ function getDeadPid() {
   });
 }
 
+function syntheticIdentity() {
+  return process.platform === 'linux'
+    ? 'linux:00000000-0000-0000-0000-000000000000:0'
+    : undefined;
+}
+
+function currentIdentity() {
+  if (process.platform !== 'linux') return undefined;
+  const stat = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8');
+  const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+  const boot = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+  return `linux:${boot}:${fields[19]}`;
+}
+
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nansen-wallet-concurrency-'));
   roots.push(root);
@@ -215,6 +229,34 @@ describe('wallet mutation concurrency', () => {
     }
   });
 
+  it('returns normally when a transient release failure succeeds on retry', async () => {
+    const { home, walletsDir } = fixture();
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    const walletUrl = pathToFileURL(path.join(repo, 'src', 'wallet.js')).href;
+    const { withWalletMutationLock } = await import(`${walletUrl}?release-retry=${Date.now()}`);
+    const originalRenameSync = fs.renameSync;
+    let releaseAttempts = 0;
+    fs.renameSync = (from, to) => {
+      if (String(from).endsWith('.wallet-mutation.lock') && String(to).includes('.released-')) {
+        releaseAttempts++;
+        if (releaseAttempts === 1) {
+          const error = new Error('transient release failure');
+          error.code = 'EIO';
+          throw error;
+        }
+      }
+      return originalRenameSync(from, to);
+    };
+    try {
+      expect(withWalletMutationLock(() => 'committed')).toBe('committed');
+      expect(releaseAttempts).toBe(2);
+      expect(fs.existsSync(path.join(walletsDir, '.wallet-mutation.lock'))).toBe(false);
+    } finally {
+      fs.renameSync = originalRenameSync;
+    }
+  });
+
   it('rejects Promise-returning callbacks after releasing the lock', async () => {
     const { home, walletsDir } = fixture();
     process.env.HOME = home;
@@ -263,7 +305,7 @@ describe('wallet mutation concurrency', () => {
     }
   });
 
-  it('recovers a lock whose owner and prior recovery process are dead', async () => {
+  it('fails closed when a previous stale-lock recovery was interrupted', async () => {
     const { home, walletsDir } = fixture();
     const deadPid = await getDeadPid();
     const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
@@ -272,22 +314,25 @@ describe('wallet mutation concurrency', () => {
     fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
       pid: deadPid,
       token: ownerToken,
+      identity: syntheticIdentity(),
       createdAt: new Date().toISOString(),
     }));
     fs.writeFileSync(path.join(lockPath, 'recovery.json'), JSON.stringify({
       pid: deadPid,
       token: 'b'.repeat(32),
       ownerToken,
+      identity: syntheticIdentity(),
       createdAt: new Date().toISOString(),
     }));
 
     process.env.HOME = home;
     process.env.USERPROFILE = home;
     const walletUrl = pathToFileURL(path.join(repo, 'src', 'wallet.js')).href;
-    const { createWallet } = await import(`${walletUrl}?stale=${Date.now()}`);
-    expect(() => createWallet('recovered', 'recovered-password')).not.toThrow();
-    expect(fs.existsSync(lockPath)).toBe(false);
-    expect(fs.readdirSync(walletsDir).filter(file => file.includes('.stale-'))).toEqual([]);
+    const { withWalletMutationLock } = await import(`${walletUrl}?stale=${Date.now()}`);
+    expect(() => withWalletMutationLock(() => 'must not run', { waitMs: 40, pollMs: 5 }))
+      .toThrow(/recovery was interrupted.*remove .*wallet-mutation\.lock/i);
+    expect(fs.existsSync(lockPath)).toBe(true);
+    expect(fs.existsSync(path.join(lockPath, 'recovery.json'))).toBe(true);
   });
 
   it.skipIf(process.platform !== 'linux')('recovers a stale lock when its PID has been reused', async () => {
@@ -309,17 +354,118 @@ describe('wallet mutation concurrency', () => {
     expect(fs.existsSync(lockPath)).toBe(false);
   });
 
-  it('lets many contenders recover the same dead owner and recovery marker', async () => {
+  it.skipIf(process.platform !== 'linux')('rejects a stable lock record without process identity', async () => {
+    const { home, walletsDir } = fixture();
+    const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
+    fs.mkdirSync(lockPath);
+    fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
+      pid: process.pid,
+      token: 'e'.repeat(32),
+      createdAt: new Date().toISOString(),
+    }));
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    const walletUrl = pathToFileURL(path.join(repo, 'src', 'wallet.js')).href;
+    const { withWalletMutationLock } = await import(`${walletUrl}?missing-identity=${Date.now()}`);
+
+    expect(() => withWalletMutationLock(() => {}, { waitMs: 40, pollMs: 5 }))
+      .toThrow(/malformed owner metadata/i);
+  });
+
+  it.skipIf(process.platform !== 'linux')('rejects a recovery record without process identity', async () => {
+    const { home, walletsDir } = fixture();
+    const deadPid = await getDeadPid();
+    const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
+    const ownerToken = 'a'.repeat(32);
+    fs.mkdirSync(lockPath);
+    fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
+      pid: deadPid,
+      token: ownerToken,
+      identity: syntheticIdentity(),
+      createdAt: new Date().toISOString(),
+    }));
+    fs.writeFileSync(path.join(lockPath, 'recovery.json'), JSON.stringify({
+      pid: process.pid,
+      token: 'b'.repeat(32),
+      ownerToken,
+      createdAt: new Date().toISOString(),
+    }));
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    const walletUrl = pathToFileURL(path.join(repo, 'src', 'wallet.js')).href;
+    const { withWalletMutationLock } = await import(`${walletUrl}?missing-recovery-identity=${Date.now()}`);
+
+    expect(() => withWalletMutationLock(() => {}, { waitMs: 40, pollMs: 5 }))
+      .toThrow(/malformed recovery marker/i);
+  });
+
+  it('surfaces a stable lock directory whose owner metadata is missing', async () => {
+    const { home, walletsDir } = fixture();
+    const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
+    fs.mkdirSync(lockPath);
+    fs.writeFileSync(path.join(lockPath, 'unexpected-entry'), 'preserve');
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    const walletUrl = pathToFileURL(path.join(repo, 'src', 'wallet.js')).href;
+    const { withWalletMutationLock } = await import(`${walletUrl}?missing-owner=${Date.now()}`);
+    const started = Date.now();
+
+    expect(() => withWalletMutationLock(() => {}, { waitMs: 40, pollMs: 5 }))
+      .toThrow(/invalid: missing owner metadata/i);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  it('retries when missing owner metadata belongs to a replaced lock inode', async () => {
+    const { home, walletsDir } = fixture();
+    const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
+    const ownerPath = path.join(lockPath, 'owner.json');
+    fs.mkdirSync(lockPath);
+    fs.writeFileSync(ownerPath, JSON.stringify({
+      pid: process.pid,
+      token: 'a'.repeat(32),
+      identity: currentIdentity(),
+      createdAt: new Date().toISOString(),
+    }));
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    const originalLstatSync = fs.lstatSync;
+    let handedOff = false;
+    fs.lstatSync = (file, ...args) => {
+      if (!handedOff && path.resolve(String(file)) === path.resolve(ownerPath)) {
+        handedOff = true;
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        fs.mkdirSync(lockPath);
+        fs.writeFileSync(ownerPath, JSON.stringify({
+          pid: process.pid,
+          token: 'c'.repeat(32),
+          identity: currentIdentity(),
+          createdAt: new Date().toISOString(),
+        }));
+        const error = new Error('old owner disappeared');
+        error.code = 'ENOENT';
+        throw error;
+      }
+      return originalLstatSync(file, ...args);
+    };
+    try {
+      const walletUrl = pathToFileURL(path.join(repo, 'src', 'wallet.js')).href;
+      const { withWalletMutationLock } = await import(`${walletUrl}?owner-inode-handoff=${Date.now()}`);
+      expect(() => withWalletMutationLock(() => {}, { waitMs: 40, pollMs: 5 }))
+        .toThrow(/busy .*process/i);
+      expect(handedOff).toBe(true);
+    } finally {
+      fs.lstatSync = originalLstatSync;
+    }
+  });
+
+  it('lets many contenders recover the same dead owner', async () => {
     const { home, markerDir, walletsDir } = fixture();
     const deadPid = await getDeadPid();
     const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
     const ownerToken = 'a'.repeat(32);
     fs.mkdirSync(lockPath);
     fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
-      pid: deadPid, token: ownerToken, createdAt: new Date().toISOString(),
-    }));
-    fs.writeFileSync(path.join(lockPath, 'recovery.json'), JSON.stringify({
-      pid: deadPid, token: 'b'.repeat(32), ownerToken, createdAt: new Date().toISOString(),
+      pid: deadPid, token: ownerToken, identity: syntheticIdentity(), createdAt: new Date().toISOString(),
     }));
 
     const results = await Promise.all(Array.from({ length: 12 }, (_, index) =>
@@ -358,40 +504,109 @@ describe('wallet mutation concurrency', () => {
     }
   });
 
-  it('retries when another recoverer wins the recovery-marker unlink race', async () => {
+  for (const code of ['EPERM', 'EACCES']) {
+    it(`bounds persistent ${code} candidate rename failures when the destination is absent`, async () => {
+      const { home, walletsDir } = fixture();
+      process.env.HOME = home;
+      process.env.USERPROFILE = home;
+      const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
+      const originalRenameSync = fs.renameSync;
+      let attempts = 0;
+      fs.renameSync = (from, to) => {
+        if (path.resolve(String(to)) === path.resolve(lockPath) && String(from).includes('.candidate-')) {
+          attempts++;
+          const error = new Error(`persistent ${code}`);
+          error.code = code;
+          throw error;
+        }
+        return originalRenameSync(from, to);
+      };
+      try {
+        const walletUrl = pathToFileURL(path.join(repo, 'src', 'wallet.js')).href;
+        const { withWalletMutationLock } = await import(`${walletUrl}?persistent-${code}=${Date.now()}`);
+        const started = Date.now();
+        let thrown;
+        try { withWalletMutationLock(() => {}, { waitMs: 40, pollMs: 5 }); } catch (error) { thrown = error; }
+        expect(thrown?.code).toBe(code);
+        expect(Date.now() - started).toBeLessThan(500);
+        expect(attempts).toBeGreaterThan(1);
+      } finally {
+        fs.renameSync = originalRenameSync;
+      }
+    });
+  }
+
+  for (const code of ['EIO', 'ENOENT']) {
+    it(`throws unexpected ${code} candidate rename failures when the destination is absent`, async () => {
+      const { home, walletsDir } = fixture();
+      process.env.HOME = home;
+      process.env.USERPROFILE = home;
+      const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
+      const originalRenameSync = fs.renameSync;
+      let attempts = 0;
+      fs.renameSync = (from, to) => {
+        if (path.resolve(String(to)) === path.resolve(lockPath) && String(from).includes('.candidate-')) {
+          attempts++;
+          const error = new Error(`unexpected ${code}`);
+          error.code = code;
+          throw error;
+        }
+        return originalRenameSync(from, to);
+      };
+      try {
+        const walletUrl = pathToFileURL(path.join(repo, 'src', 'wallet.js')).href;
+        const { withWalletMutationLock } = await import(`${walletUrl}?unexpected-${code}=${Date.now()}`);
+        let thrown;
+        try { withWalletMutationLock(() => {}, { waitMs: 100, pollMs: 5 }); } catch (error) { thrown = error; }
+        expect(thrown?.code).toBe(code);
+        expect(attempts).toBe(1);
+      } finally {
+        fs.renameSync = originalRenameSync;
+      }
+    });
+  }
+
+
+  it('preserves a live recovery claim published during an owner handoff', async () => {
     const { home, walletsDir } = fixture();
     const deadPid = await getDeadPid();
     const lockPath = path.join(walletsDir, '.wallet-mutation.lock');
+    const ownerPath = path.join(lockPath, 'owner.json');
     const recoveryPath = path.join(lockPath, 'recovery.json');
-    const ownerToken = 'a'.repeat(32);
     fs.mkdirSync(lockPath);
-    fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
-      pid: deadPid, token: ownerToken, createdAt: new Date().toISOString(),
-    }));
-    fs.writeFileSync(recoveryPath, JSON.stringify({
-      pid: deadPid, token: 'b'.repeat(32), ownerToken, createdAt: new Date().toISOString(),
+    fs.writeFileSync(ownerPath, JSON.stringify({
+      pid: deadPid, token: 'a'.repeat(32), identity: syntheticIdentity(), createdAt: new Date().toISOString(),
     }));
     process.env.HOME = home;
     process.env.USERPROFILE = home;
-    const originalUnlinkSync = fs.unlinkSync;
-    let injected = false;
-    fs.unlinkSync = file => {
-      if (!injected && path.resolve(String(file)) === path.resolve(recoveryPath)) {
-        injected = true;
-        originalUnlinkSync(file);
-        const error = new Error('already removed by competing recoverer');
-        error.code = 'ENOENT';
-        throw error;
+    const originalLinkSync = fs.linkSync;
+    let handedOff = false;
+    fs.linkSync = (from, to) => {
+      if (!handedOff && path.resolve(String(to)) === path.resolve(recoveryPath)) {
+        handedOff = true;
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        fs.mkdirSync(lockPath);
+        fs.writeFileSync(ownerPath, JSON.stringify({
+          pid: deadPid, token: 'c'.repeat(32), identity: syntheticIdentity(), createdAt: new Date().toISOString(),
+        }));
+        fs.writeFileSync(recoveryPath, JSON.stringify({
+          pid: process.pid,
+          token: 'd'.repeat(32),
+          ownerToken: 'c'.repeat(32),
+          identity: currentIdentity(),
+          createdAt: new Date().toISOString(),
+        }));
       }
-      return originalUnlinkSync(file);
+      return originalLinkSync(from, to);
     };
     try {
       const walletUrl = pathToFileURL(path.join(repo, 'src', 'wallet.js')).href;
-      const { withWalletMutationLock } = await import(`${walletUrl}?unlink-race=${Date.now()}`);
-      expect(withWalletMutationLock(() => 'recovered')).toBe('recovered');
-      expect(injected).toBe(true);
+      const { withWalletMutationLock } = await import(`${walletUrl}?live-handoff=${Date.now()}`);
+      expect(() => withWalletMutationLock(() => {}, { waitMs: 40, pollMs: 5 }))
+        .toThrow(/busy while another process recovers/i);
+      expect(JSON.parse(fs.readFileSync(recoveryPath, 'utf8')).token).toBe('d'.repeat(32));
     } finally {
-      fs.unlinkSync = originalUnlinkSync;
+      fs.linkSync = originalLinkSync;
     }
   });
 
@@ -402,7 +617,7 @@ describe('wallet mutation concurrency', () => {
     const ownerPath = path.join(lockPath, 'owner.json');
     fs.mkdirSync(lockPath);
     fs.writeFileSync(ownerPath, JSON.stringify({
-      pid: deadPid, token: 'a'.repeat(32), createdAt: new Date().toISOString(),
+      pid: deadPid, token: 'a'.repeat(32), identity: syntheticIdentity(), createdAt: new Date().toISOString(),
     }));
     process.env.HOME = home;
     process.env.USERPROFILE = home;
@@ -414,7 +629,7 @@ describe('wallet mutation concurrency', () => {
         fs.rmSync(lockPath, { recursive: true, force: true });
         fs.mkdirSync(lockPath);
         fs.writeFileSync(ownerPath, JSON.stringify({
-          pid: deadPid, token: 'c'.repeat(32), createdAt: new Date().toISOString(),
+          pid: deadPid, token: 'c'.repeat(32), identity: syntheticIdentity(), createdAt: new Date().toISOString(),
         }));
         handedOff = true;
       }

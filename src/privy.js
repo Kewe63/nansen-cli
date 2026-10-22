@@ -29,6 +29,18 @@ import { trace } from "./debug.js";
 
 const PRIVY_BASE_URL = "https://api.privy.io/v1";
 
+export class PrivyWalletLocalCommitError extends Error {
+  constructor(configError, rollbackError) {
+    super(`Privy wallet reference was written, but config persistence failed and the local reference could not be rolled back: ${configError.message}`, { cause: configError });
+    this.name = 'PrivyWalletLocalCommitError';
+    this.code = 'PRIVY_WALLET_LOCAL_COMMIT_PARTIAL';
+    this.committed = true;
+    this.partial = true;
+    this.configError = configError;
+    this.rollbackError = rollbackError;
+  }
+}
+
 // ============= PrivyClient =============
 
 export class PrivyClient {
@@ -213,9 +225,13 @@ export async function createPrivyWalletPair(name) {
           config.defaultWallet = name;
           writeWalletJsonAtomic(configPath, config);
         }
-      } catch (err) {
-        try { fs.unlinkSync(walletFile); } catch { /* best effort rollback */ }
-        throw err;
+      } catch (configError) {
+        try {
+          fs.unlinkSync(walletFile);
+        } catch (rollbackError) {
+          throw new PrivyWalletLocalCommitError(configError, rollbackError);
+        }
+        throw configError;
       }
     });
   } catch (err) {

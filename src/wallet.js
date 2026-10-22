@@ -300,6 +300,8 @@ function readLockJson(filePath, label) {
 }
 
 function validateLockRecord(record, label, { ownerToken = null } = {}) {
+  const validIdentity = typeof record?.identity === 'string'
+    && /^[A-Za-z0-9:._-]{1,200}$/.test(record.identity);
   const valid = record
     && Number.isSafeInteger(record.pid)
     && record.pid > 0
@@ -307,31 +309,77 @@ function validateLockRecord(record, label, { ownerToken = null } = {}) {
     && /^[a-f0-9]{32}$/.test(record.token)
     && typeof record.createdAt === 'string'
     && !Number.isNaN(Date.parse(record.createdAt))
-    && (record.identity === undefined || record.identity === null ||
-      (typeof record.identity === 'string' && /^[A-Za-z0-9:._-]{1,200}$/.test(record.identity)));
+    && (process.platform === 'linux'
+      ? validIdentity
+      : (record.identity === undefined || record.identity === null || validIdentity));
   if (!valid || (ownerToken !== null && record.ownerToken !== ownerToken)) {
     throw new Error(`Wallet mutation lock is invalid: malformed ${label}. Stop other wallet commands, remove the lock directory, and retry.`);
   }
   return record;
 }
 
+function currentLockIdentity() {
+  const identity = linuxProcessIdentity(process.pid);
+  if (process.platform === 'linux' && !identity) {
+    throw new Error('Wallet mutation lock cannot establish the current Linux process identity; refusing unsafe PID-only locking.');
+  }
+  return identity;
+}
+
+function lockDirectoryChanged(lockPath, expectedStat) {
+  try {
+    const current = fs.lstatSync(lockPath, { bigint: true });
+    return !expectedStat || String(current.dev) !== expectedStat.dev ||
+      String(current.ino) !== expectedStat.ino || String(current.ctimeNs) !== expectedStat.ctimeNs;
+  } catch (err) {
+    if (err.code === 'ENOENT') return true;
+    throw err;
+  }
+}
+
+function removeOwnRecoveryClaim(expectedClaim, recoveryPath) {
+  if (!expectedClaim) return;
+  try {
+    const publishedStat = fs.lstatSync(recoveryPath);
+    if (expectedClaim.dev === publishedStat.dev && expectedClaim.ino === publishedStat.ino) {
+      fs.unlinkSync(recoveryPath);
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+}
+
 function inspectWalletMutationLock(lockPath) {
-  const stat = fs.lstatSync(lockPath);
+  const stat = fs.lstatSync(lockPath, { bigint: true });
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new Error(`Wallet mutation lock is invalid: ${lockPath} must be a real directory. Stop other wallet commands, remove it, and retry.`);
   }
-  return validateLockRecord(readLockJson(path.join(lockPath, 'owner.json'), 'owner metadata'), 'owner metadata');
+  try {
+    const owner = validateLockRecord(readLockJson(path.join(lockPath, 'owner.json'), 'owner metadata'), 'owner metadata');
+    Object.defineProperty(owner, 'lockDirectoryStat', {
+      value: { dev: String(stat.dev), ino: String(stat.ino), ctimeNs: String(stat.ctimeNs) },
+    });
+    return owner;
+  } catch (err) {
+    if (err && (typeof err === 'object' || typeof err === 'function')) {
+      try {
+        err.lockDirectoryStat = { dev: String(stat.dev), ino: String(stat.ino), ctimeNs: String(stat.ctimeNs) };
+      } catch { /* preserve immutable errors */ }
+    }
+    throw err;
+  }
 }
 
 function recoverDeadWalletMutationLock(lockPath, owner) {
   const recoveryPath = path.join(lockPath, 'recovery.json');
   const recoveryToken = crypto.randomBytes(16).toString('hex');
   const recoveryCandidatePath = path.join(lockPath, `.recovery-${process.pid}-${recoveryToken}.candidate`);
+  let publishedClaim;
   const recovery = {
     pid: process.pid,
     token: recoveryToken,
     ownerToken: owner.token,
-    identity: linuxProcessIdentity(process.pid),
+    identity: currentLockIdentity(),
     createdAt: new Date().toISOString(),
   };
 
@@ -341,6 +389,7 @@ function recoverDeadWalletMutationLock(lockPath, owner) {
     // contenders between open and write.
     writePrivateJson(recoveryCandidatePath, recovery);
     fs.linkSync(recoveryCandidatePath, recoveryPath);
+    publishedClaim = fs.lstatSync(recoveryCandidatePath);
   } catch (err) {
     if (err.code === 'ENOENT') return false;
     if (err.code !== 'EEXIST') throw err;
@@ -351,13 +400,22 @@ function recoverDeadWalletMutationLock(lockPath, owner) {
       if (readErr.code === 'ENOENT') return false;
       throw readErr;
     }
-    if (existing.ownerToken !== owner.token) {
-      try { fs.unlinkSync(recoveryPath); } catch (unlinkErr) { if (unlinkErr.code !== 'ENOENT') throw unlinkErr; }
-      return false;
+    let canonicalOwner;
+    try {
+      canonicalOwner = inspectWalletMutationLock(lockPath);
+    } catch (inspectErr) {
+      if (inspectErr.code === 'ENOENT' && lockDirectoryChanged(lockPath, inspectErr.lockDirectoryStat)) return false;
+      throw inspectErr;
+    }
+    // The caller's owner snapshot may predate a handoff. Never remove a marker
+    // merely because it names a different owner: it may be the successor's live
+    // recovery claim.
+    if (canonicalOwner.token !== owner.token) return false;
+    if (existing.ownerToken !== canonicalOwner.token) {
+      throw new Error('Wallet mutation lock is invalid: recovery marker does not match its owner. Stop other wallet commands, remove the lock directory, and retry.', { cause: err });
     }
     if (processIsAlive(existing)) return false;
-    try { fs.unlinkSync(recoveryPath); } catch (unlinkErr) { if (unlinkErr.code !== 'ENOENT') throw unlinkErr; }
-    return false;
+    throw new Error(`Wallet mutation recovery was interrupted by process ${existing.pid}. Stop other wallet commands, remove ${lockPath}, and retry.`, { cause: err });
   } finally {
     try { fs.unlinkSync(recoveryCandidatePath); } catch { /* lock may have been quarantined */ }
   }
@@ -369,7 +427,10 @@ function recoverDeadWalletMutationLock(lockPath, owner) {
     if (err.code === 'ENOENT') return false;
     throw err;
   }
-  if (currentOwner.token !== owner.token) return false;
+  if (currentOwner.token !== owner.token) {
+    removeOwnRecoveryClaim(publishedClaim, recoveryPath);
+    return false;
+  }
 
   const stalePath = path.join(
     getWalletsDir(),
@@ -447,12 +508,13 @@ export function withWalletMutationLock(fn, {
   }
 
   const token = crypto.randomBytes(16).toString('hex');
+  const identity = currentLockIdentity();
   const candidatePath = path.join(walletsDir, `${WALLET_MUTATION_LOCK}.candidate-${process.pid}-${token}`);
   mkdirPrivateSync(candidatePath);
   writePrivateJson(path.join(candidatePath, 'owner.json'), {
     pid: process.pid,
     token,
-    identity: linuxProcessIdentity(process.pid),
+    identity,
     createdAt: new Date().toISOString(),
   });
 
@@ -464,7 +526,8 @@ export function withWalletMutationLock(fn, {
         fs.renameSync(candidatePath, lockPath);
         acquired = true;
         break;
-      } catch (_err) {
+      } catch (renameError) {
+        const retryableRename = ['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES'].includes(renameError.code);
         let lockExists = false;
         try {
           fs.lstatSync(lockPath);
@@ -472,18 +535,30 @@ export function withWalletMutationLock(fn, {
         } catch (statErr) {
           if (statErr.code !== 'ENOENT') throw statErr;
         }
-        // Another releaser/recoverer may remove the destination after rename
-        // reports EEXIST/ENOTEMPTY. The still-valid candidate can retry.
-        if (!lockExists) continue;
+        if (!lockExists && !retryableRename) throw renameError;
+        // Another releaser/recoverer may remove the destination after a
+        // retryable handoff error. Every retry is still deadline-bounded.
+        if (!lockExists) {
+          if (Date.now() >= deadline) throw renameError;
+          sleepSync(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+          continue;
+        }
       }
 
       let owner;
       try {
         owner = inspectWalletMutationLock(lockPath);
       } catch (err) {
-        // A competing stale-lock recovery may have quarantined the directory
-        // or its metadata after our existence check. Retry the candidate.
-        if (err.code === 'ENOENT') continue;
+        // Retry ENOENT only when the canonical directory itself disappeared.
+        // A stable directory missing owner.json is an invalid lock, not
+        // transient contention.
+        if (err.code === 'ENOENT' && lockDirectoryChanged(lockPath, err.lockDirectoryStat)) {
+          if (Date.now() >= deadline) {
+            throw new Error('Wallet mutation lock changed continuously while waiting to acquire it. Retry the wallet command.', { cause: err });
+          }
+          sleepSync(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+          continue;
+        }
         throw err;
       }
       if (!processIsAlive(owner)) {
@@ -517,14 +592,22 @@ export function withWalletMutationLock(fn, {
     }
 
     let releaseError;
-    try {
-      releaseWalletMutationLock(lockPath, token);
-      acquired = false;
-    } catch (err) {
-      releaseError = err;
-    } finally {
-      HELD_WALLET_MUTATION_LOCKS.delete(lockPath);
+    let firstReleaseError;
+    for (let attempt = 0; attempt < 2 && acquired; attempt++) {
+      try {
+        releaseWalletMutationLock(lockPath, token);
+        acquired = false;
+      } catch (err) {
+        if (attempt === 0) firstReleaseError = err;
+        else {
+          releaseError = err;
+          if (releaseError && (typeof releaseError === 'object' || typeof releaseError === 'function')) {
+            try { releaseError.firstReleaseError = firstReleaseError; } catch { /* preserve immutable errors */ }
+          }
+        }
+      }
     }
+    HELD_WALLET_MUTATION_LOCKS.delete(lockPath);
 
     if (callbackFailed) {
       if (releaseError && callbackError && (typeof callbackError === 'object' || typeof callbackError === 'function')) {
@@ -535,9 +618,7 @@ export function withWalletMutationLock(fn, {
     if (releaseError) throw new WalletMutationCommittedError(releaseError);
     return result;
   } finally {
-    if (acquired) {
-      try { releaseWalletMutationLock(lockPath, token); } catch { /* the primary error already reports release failure */ }
-    } else {
+    if (!acquired) {
       fs.rmSync(candidatePath, { recursive: true, force: true });
     }
     HELD_WALLET_MUTATION_LOCKS.delete(lockPath);
